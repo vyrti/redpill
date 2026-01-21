@@ -1,0 +1,65 @@
+[package]
+name = "redpill-term"
+version = "0.0.1"
+edition = "2021"
+description = "A cross-platform GUI terminal application with SSH session management"
+authors = ["RedPill Contributors"]
+license = "MIT"
+readme = "README.md"
+
+[lib]
+name = "redpill"
+path = "src/lib.rs"
+
+[[bin]]
+name = "redpill"
+path = "src/main.rs"
+
+[dependencies]
+gpui = { git = "https://github.com/zed-industries/zed", package = "gpui" }
+
+# Terminal Emulation
+alacritty_terminal = "0.24"
+portable-pty = "0.8"
+
+# SSH
+russh = "0.46"
+russh-keys = "0.46"
+
+# Async Runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# Serialization & Config
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Utilities
+uuid = { version = "1.0", features = ["v4", "serde"] }
+dirs = "5.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+parking_lot = "0.12"
+smallvec = "1.13"
+
+[dev-dependencies]
+tempfile = "3"
+
+[patch.crates-io]
+# Force consistent versions from servo/core-foundation-rs at core-text v21.0.0
+# This ensures core-text, core-foundation, and core-graphics all use compatible versions
+core-text = { git = "https://github.com/servo/core-foundation-rs", rev = "b10f1efc48343fc5590127ec6d890ffbb8b5bd02" }
+core-foundation = { git = "https://github.com/servo/core-foundation-rs", rev = "b10f1efc48343fc5590127ec6d890ffbb8b5bd02" }
+core-foundation-sys = { git = "https://github.com/servo/core-foundation-rs", rev = "b10f1efc48343fc5590127ec6d890ffbb8b5bd02" }
+core-graphics = { git = "https://github.com/servo/core-foundation-rs", rev = "b10f1efc48343fc5590127ec6d890ffbb8b5bd02" }
+core-graphics-types = { git = "https://github.com/servo/core-foundation-rs", rev = "b10f1efc48343fc5590127ec6d890ffbb8b5bd02" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = 0
+strip = true
