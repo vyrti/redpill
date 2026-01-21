@@ -161,10 +161,11 @@ impl SshBackend {
             }
         };
 
-        // Request a PTY
+        // Request a PTY (want_reply=true to wait for server confirmation)
+        tracing::info!("Requesting PTY...");
         if let Err(e) = channel
             .request_pty(
-                false,
+                true,
                 "xterm-256color",
                 self.size.cols as u32,
                 self.size.rows as u32,
@@ -177,15 +178,18 @@ impl SshBackend {
             self.state = ConnectionState::Failed;
             return Err(SshError::SshError(format!("Failed to request PTY: {}", e)));
         }
+        tracing::info!("PTY granted");
 
-        // Request a shell
-        if let Err(e) = channel.request_shell(false).await {
+        // Request a shell (want_reply=true to wait for server confirmation)
+        tracing::info!("Requesting shell...");
+        if let Err(e) = channel.request_shell(true).await {
             self.state = ConnectionState::Failed;
             return Err(SshError::SshError(format!(
                 "Failed to request shell: {}",
                 e
             )));
         }
+        tracing::info!("Shell started");
 
         self.session = Some(session);
         self.channel = Some(channel);
@@ -198,37 +202,59 @@ impl SshBackend {
     /// Authenticate with the server using the configured method
     async fn authenticate(&self, session: &mut Handle<SshClientHandler>) -> SshResult<bool> {
         let username = &self.config.username;
+        tracing::info!("Authenticating as user: {}", username);
 
         match &self.config.auth {
             AuthMethod::Password { password, .. } => {
+                tracing::info!("Using password authentication");
                 let password = password.as_ref().ok_or_else(|| {
                     SshError::AuthenticationFailed("Password not provided".to_string())
                 })?;
 
                 match session.authenticate_password(username, password).await {
-                    Ok(result) => Ok(result),
-                    Err(e) => Err(SshError::AuthenticationFailed(e.to_string())),
+                    Ok(result) => {
+                        tracing::info!("Password auth result: {}", result);
+                        Ok(result)
+                    }
+                    Err(e) => {
+                        tracing::error!("Password auth error: {}", e);
+                        Err(SshError::AuthenticationFailed(e.to_string()))
+                    }
                 }
             }
 
             AuthMethod::PrivateKey {
                 path, passphrase, ..
             } => {
+                tracing::info!("Using private key authentication from: {:?}", path);
                 let key = load_private_key(path, passphrase.as_deref())?;
                 match session.authenticate_publickey(username, Arc::new(key)).await {
-                    Ok(result) => Ok(result),
-                    Err(e) => Err(SshError::AuthenticationFailed(e.to_string())),
+                    Ok(result) => {
+                        tracing::info!("Key auth result: {}", result);
+                        Ok(result)
+                    }
+                    Err(e) => {
+                        tracing::error!("Key auth error: {}", e);
+                        Err(SshError::AuthenticationFailed(e.to_string()))
+                    }
                 }
             }
 
             AuthMethod::Agent => {
+                tracing::info!("Using SSH agent authentication");
                 // Try to connect to SSH agent
                 match self.authenticate_with_agent(session, username).await {
-                    Ok(result) => Ok(result),
-                    Err(e) => Err(SshError::AuthenticationFailed(format!(
-                        "Agent authentication failed: {}",
-                        e
-                    ))),
+                    Ok(result) => {
+                        tracing::info!("Agent auth result: {}", result);
+                        Ok(result)
+                    }
+                    Err(e) => {
+                        tracing::error!("Agent auth error: {}", e);
+                        Err(SshError::AuthenticationFailed(format!(
+                            "Agent authentication failed: {}",
+                            e
+                        )))
+                    }
                 }
             }
         }
