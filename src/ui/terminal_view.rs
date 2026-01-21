@@ -154,8 +154,52 @@ impl TerminalView {
         // Focus on click
         cx.focus_self(window);
 
-        // Clear selection on click
         let term = self.terminal.lock();
+        let mode = term.mode();
+
+        // Debug: print mouse mode status
+        eprintln!("[MOUSE] click at {:?}, mode: REPORT_CLICK={}, DRAG={}, MOTION={}, SGR={}",
+            event.position,
+            mode.contains(TermMode::MOUSE_REPORT_CLICK),
+            mode.contains(TermMode::MOUSE_DRAG),
+            mode.contains(TermMode::MOUSE_MOTION),
+            mode.contains(TermMode::SGR_MOUSE)
+        );
+
+        // Check if terminal wants mouse events
+        if mode.contains(TermMode::MOUSE_REPORT_CLICK)
+            || mode.contains(TermMode::MOUSE_DRAG)
+            || mode.contains(TermMode::MOUSE_MOTION)
+        {
+            // Send mouse event to terminal application
+            let point = self.mouse_to_point(event.position);
+            let button = match event.button {
+                MouseButton::Left => 0,
+                MouseButton::Middle => 1,
+                MouseButton::Right => 2,
+                _ => 0,
+            };
+            let col = point.column.0 as u32 + 1; // 1-based
+            let row = point.line.0 as u32 + 1; // 1-based
+
+            // Use SGR mouse protocol if enabled, otherwise use normal protocol
+            let mouse_report = if mode.contains(TermMode::SGR_MOUSE) {
+                format!("\x1b[<{};{};{}M", button, col, row)
+            } else {
+                // X10 mouse protocol (limited to 223 columns/rows)
+                let cb = (32 + button) as u8;
+                let cx_char = (32 + col.min(223)) as u8;
+                let cy_char = (32 + row.min(223)) as u8;
+                format!("\x1b[M{}{}{}", cb as char, cx_char as char, cy_char as char)
+            };
+            eprintln!("[MOUSE] sending report: {:?} at col={} row={}", mouse_report.as_bytes(), col, row);
+            term.write(mouse_report.as_bytes());
+            drop(term);
+            cx.notify();
+            return;
+        }
+
+        // Normal selection behavior
         term.clear_selection();
 
         // Start new selection
@@ -177,12 +221,96 @@ impl TerminalView {
         }
     }
 
-    fn handle_mouse_up(&mut self, _event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn handle_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let term = self.terminal.lock();
+        let mode = term.mode();
+
+        // Check if terminal wants mouse events
+        if mode.contains(TermMode::MOUSE_REPORT_CLICK)
+            || mode.contains(TermMode::MOUSE_DRAG)
+            || mode.contains(TermMode::MOUSE_MOTION)
+        {
+            // Send mouse release event to terminal application
+            let point = self.mouse_to_point(event.position);
+            let button = match event.button {
+                MouseButton::Left => 0,
+                MouseButton::Middle => 1,
+                MouseButton::Right => 2,
+                _ => 0,
+            };
+            let col = point.column.0 as u32 + 1;
+            let row = point.line.0 as u32 + 1;
+
+            // Use SGR mouse protocol for release (lowercase 'm')
+            let mouse_report = if mode.contains(TermMode::SGR_MOUSE) {
+                format!("\x1b[<{};{};{}m", button, col, row)
+            } else {
+                // X10 protocol uses button 3 for release
+                let cb = (32 + 3) as u8; // release
+                let cx_char = (32 + col.min(223)) as u8;
+                let cy_char = (32 + row.min(223)) as u8;
+                format!("\x1b[M{}{}{}", cb as char, cx_char as char, cy_char as char)
+            };
+            term.write(mouse_report.as_bytes());
+            drop(term);
+            cx.notify();
+            return;
+        }
+
+        drop(term);
         self.is_selecting = false;
         cx.notify();
     }
 
     fn handle_scroll(&mut self, event: &ScrollWheelEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let term = self.terminal.lock();
+        let mode = term.mode();
+
+        // Check if terminal wants mouse events (scroll = mouse button 64/65)
+        if mode.contains(TermMode::MOUSE_REPORT_CLICK)
+            || mode.contains(TermMode::MOUSE_DRAG)
+            || mode.contains(TermMode::MOUSE_MOTION)
+        {
+            let lines = match event.delta {
+                ScrollDelta::Lines(lines) => -lines.y as i32,
+                ScrollDelta::Pixels(pixels) => {
+                    let cell_h: f32 = self.cell_height.into();
+                    if cell_h > 0.0 {
+                        let px_y: f32 = pixels.y.into();
+                        -(px_y / cell_h).round() as i32
+                    } else {
+                        0
+                    }
+                }
+            };
+
+            if lines != 0 {
+                let point = self.mouse_to_point(event.position);
+                let col = point.column.0 as u32 + 1;
+                let row = point.line.0 as u32 + 1;
+
+                // Button 64 = scroll up, 65 = scroll down
+                let button = if lines < 0 { 64 } else { 65 };
+                let scroll_count = lines.abs();
+
+                for _ in 0..scroll_count {
+                    let mouse_report = if mode.contains(TermMode::SGR_MOUSE) {
+                        format!("\x1b[<{};{};{}M", button, col, row)
+                    } else {
+                        let cb = (32 + button) as u8;
+                        let cx_char = (32 + col.min(223)) as u8;
+                        let cy_char = (32 + row.min(223)) as u8;
+                        format!("\x1b[M{}{}{}", cb as char, cx_char as char, cy_char as char)
+                    };
+                    term.write(mouse_report.as_bytes());
+                }
+                drop(term);
+                cx.notify();
+                return;
+            }
+        }
+
+        // Normal scroll behavior (scrollback)
         let lines = match event.delta {
             ScrollDelta::Lines(lines) => -lines.y as i32,
             ScrollDelta::Pixels(pixels) => {
@@ -197,7 +325,6 @@ impl TerminalView {
         };
 
         if lines != 0 {
-            let term = self.terminal.lock();
             term.scroll(lines);
             cx.notify();
         }
@@ -322,6 +449,17 @@ impl Render for TerminalView {
         let font_family = self.font_family.clone();
         let font_family_paint = self.font_family.clone();
         let font_size = self.font_size;
+
+        // Update cell dimensions from font metrics for accurate mouse coordinate conversion
+        let text_system = window.text_system();
+        let font_for_measure = font(font_family.clone());
+        let font_id = text_system.resolve_font(&font_for_measure);
+        self.cell_width = text_system
+            .advance(font_id, font_size, 'M')
+            .map(|a| a.width)
+            .unwrap_or(px(8.0));
+        self.cell_height = font_size * 1.4;
+
         // Cursor is visible if blink state is true, or if we're not focused (hollow cursor always visible)
         let cursor_blink_visible = self.cursor_visible || !focused;
 

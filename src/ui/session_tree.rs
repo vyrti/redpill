@@ -120,7 +120,8 @@ impl SessionTree {
     /// Handle clicking on a session
     fn handle_open_session(&mut self, session_id: Uuid, cx: &mut Context<Self>) {
         if let Some(app_state) = cx.try_global::<AppState>() {
-            let _ = app_state.app.lock().open_ssh_session(session_id);
+            let runtime = app_state.tokio_runtime.clone();
+            let _ = app_state.app.lock().open_ssh_session(session_id, &runtime);
         }
         cx.emit(SessionTreeEvent::OpenSession(session_id));
         cx.notify();
@@ -129,7 +130,8 @@ impl SessionTree {
     /// Handle mass connect for a group
     fn handle_mass_connect(&mut self, group_id: Uuid, cx: &mut Context<Self>) {
         if let Some(app_state) = cx.try_global::<AppState>() {
-            let results = app_state.app.lock().mass_connect(group_id);
+            let runtime = app_state.tokio_runtime.clone();
+            let results = app_state.app.lock().mass_connect(group_id, &runtime);
             for result in results {
                 if let Err(e) = result {
                     tracing::error!("Mass connect error: {}", e);

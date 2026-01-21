@@ -1,5 +1,6 @@
 use parking_lot::Mutex;
 use std::sync::Arc;
+use tokio::runtime::Runtime as TokioRuntime;
 use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
 
@@ -85,7 +86,7 @@ impl RedPillApp {
     }
 
     /// Open a terminal for an SSH session (sync wrapper that spawns async task)
-    pub fn open_ssh_session(&mut self, session_id: Uuid) -> Result<Uuid, String> {
+    pub fn open_ssh_session(&mut self, session_id: Uuid, runtime: &TokioRuntime) -> Result<Uuid, String> {
         let session = self
             .session_manager
             .get_session(session_id)
@@ -105,9 +106,9 @@ impl RedPillApp {
         // Create SSH backend (not connected yet)
         let backend = SshBackend::new(ssh_session);
 
-        // Create terminal in SSH mode
+        // Create terminal in SSH mode with tokio handle for async operations
         let config = TerminalConfig::default();
-        let terminal = Terminal::new_ssh(config, backend)
+        let terminal = Terminal::new_ssh(config, backend, runtime.handle().clone())
             .map_err(|e| format!("Failed to create SSH terminal: {}", e))?;
 
         // Get the backend for the reader task
@@ -117,11 +118,11 @@ impl RedPillApp {
 
         let terminal_arc = Arc::new(Mutex::new(terminal));
 
-        // Spawn the async connection and reader task
+        // Spawn the async connection and reader task on Tokio runtime
         let terminal_weak = Arc::downgrade(&terminal_arc);
         let backend_for_connect = backend_arc.clone();
 
-        tokio::spawn(async move {
+        runtime.spawn(async move {
             // Connect to SSH server
             let connect_result = {
                 let mut backend = backend_for_connect.lock().await;
@@ -134,7 +135,19 @@ impl RedPillApp {
                 }
                 Err(e) => {
                     tracing::error!("SSH connection failed: {}", e);
-                    // TODO: Notify UI of connection failure
+                    // Display error message in terminal with nice formatting
+                    if let Some(term_arc) = terminal_weak.upgrade() {
+                        let term = term_arc.lock();
+                        let error_text = e.to_string();
+                        let error_msg = format!(
+                            "\x1b[2J\x1b[H\r\n\
+                            \x1b[1;31m  Connection Failed\x1b[0m\r\n\
+                            \r\n\
+                            \x1b[33m  {}\x1b[0m\r\n",
+                            error_text
+                        );
+                        term.write_to_pty(error_msg.as_bytes());
+                    }
                     return;
                 }
             }
@@ -218,14 +231,14 @@ impl RedPillApp {
     }
 
     /// Mass connect to all sessions in a group
-    pub fn mass_connect(&mut self, group_id: Uuid) -> Vec<Result<Uuid, String>> {
+    pub fn mass_connect(&mut self, group_id: Uuid, runtime: &TokioRuntime) -> Vec<Result<Uuid, String>> {
         let session_ids = self
             .session_manager
             .get_all_sessions_in_group_recursive(group_id);
 
         session_ids
             .into_iter()
-            .map(|id| self.open_ssh_session(id))
+            .map(|id| self.open_ssh_session(id, runtime))
             .collect()
     }
 
@@ -361,12 +374,16 @@ async fn spawn_ssh_reader(
 /// Global application state wrapper
 pub struct AppState {
     pub app: Arc<Mutex<RedPillApp>>,
+    /// Tokio runtime for async SSH operations
+    pub tokio_runtime: Arc<TokioRuntime>,
 }
 
 impl AppState {
     pub fn new() -> Self {
+        let tokio_runtime = TokioRuntime::new().expect("Failed to create Tokio runtime");
         Self {
             app: Arc::new(Mutex::new(RedPillApp::new())),
+            tokio_runtime: Arc::new(tokio_runtime),
         }
     }
 }

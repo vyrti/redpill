@@ -8,11 +8,12 @@ use alacritty_terminal::term::cell::Cell;
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
 use alacritty_terminal::tty::{self, Options as PtyOptions};
-use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
+use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb, StdSyncHandler};
 use std::collections::HashMap;
 use std::io;
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
+use tokio::runtime::Handle as TokioHandle;
 use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
 
@@ -106,6 +107,7 @@ pub enum TerminalMode2 {
     Remote {
         notifier: Notifier,
         backend: Arc<TokioMutex<SshBackend>>,
+        tokio_handle: TokioHandle,
     },
 }
 
@@ -184,7 +186,7 @@ impl Terminal {
     }
 
     /// Create an SSH terminal (display-only mode)
-    pub fn new_ssh(config: TerminalConfig, backend: SshBackend) -> io::Result<Self> {
+    pub fn new_ssh(config: TerminalConfig, backend: SshBackend, tokio_handle: TokioHandle) -> io::Result<Self> {
         let id = Uuid::new_v4();
         let (event_tx, event_rx) = event_channel();
 
@@ -207,9 +209,9 @@ impl Terminal {
         let term = Arc::new(FairMutex::new(term));
 
         // Create PTY options (we still need a PTY for the EventLoop, but it won't be used for SSH data)
-        // The PTY runs a default shell that stays idle - keyboard input goes to SSH instead
+        // Use 'cat' as a silent placeholder - it won't show a prompt and just waits for input
         let pty_config = PtyOptions {
-            shell: None, // Use default shell (it will stay idle)
+            shell: Some(tty::Shell::new("/bin/cat".to_string(), vec![])),
             working_directory: None,
             hold: false,
             env: HashMap::new(),
@@ -235,6 +237,7 @@ impl Terminal {
             mode: TerminalMode2::Remote {
                 notifier,
                 backend: backend_arc,
+                tokio_handle,
             },
             event_rx,
             config,
@@ -265,12 +268,21 @@ impl Terminal {
     /// This feeds data into alacritty for parsing and display.
     /// Use this for data received FROM SSH that needs to be rendered.
     pub fn write_to_pty(&self, data: &[u8]) {
-        let notifier = match &self.mode {
-            TerminalMode2::Local { notifier } => notifier,
-            TerminalMode2::Remote { notifier, .. } => notifier,
-        };
-        // Use Notify trait like Zed does
-        notifier.notify(data.to_vec());
+        match &self.mode {
+            TerminalMode2::Local { notifier } => {
+                // For local terminals, send through the PTY event loop
+                notifier.notify(data.to_vec());
+            }
+            TerminalMode2::Remote { .. } => {
+                // For SSH terminals, directly process data through the VT parser
+                // This ensures escape sequences (like mouse mode) are handled correctly
+                let mut processor = Processor::<StdSyncHandler>::new();
+                let mut term = self.term.lock();
+                for &byte in data {
+                    processor.advance(&mut *term, byte);
+                }
+            }
+        }
     }
 
     /// Write keyboard input (goes to PTY for local, SSH for remote)
@@ -282,11 +294,11 @@ impl Terminal {
                 // For local terminals, use Notify trait like Zed does
                 notifier.notify(data.to_vec());
             }
-            TerminalMode2::Remote { backend, .. } => {
+            TerminalMode2::Remote { backend, tokio_handle, .. } => {
                 // For SSH terminals, send to SSH backend
                 let backend = backend.clone();
                 let data = data.to_vec();
-                tokio::spawn(async move {
+                tokio_handle.spawn(async move {
                     let mut b = backend.lock().await;
                     let _ = b.write(&data).await;
                 });
@@ -347,13 +359,13 @@ impl Terminal {
             TerminalMode2::Local { notifier } => {
                 let _ = notifier.0.send(Msg::Resize(window_size));
             }
-            TerminalMode2::Remote { notifier, backend } => {
+            TerminalMode2::Remote { notifier, backend, tokio_handle } => {
                 // Notify the event loop
                 let _ = notifier.0.send(Msg::Resize(window_size));
 
                 // Notify SSH backend
                 let backend = backend.clone();
-                tokio::spawn(async move {
+                tokio_handle.spawn(async move {
                     let mut b = backend.lock().await;
                     let ssh_size = super::ssh_backend::TerminalSize {
                         cols: size.cols,
