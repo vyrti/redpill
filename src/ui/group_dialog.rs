@@ -87,7 +87,7 @@ impl GroupDialog {
         let window_options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                 None,
-                size(px(380.0), px(280.0)),
+                size(px(400.0), px(300.0)),
                 cx,
             ))),
             titlebar: Some(TitlebarOptions {
@@ -95,7 +95,7 @@ impl GroupDialog {
                 appears_transparent: false,
                 ..Default::default()
             }),
-            kind: WindowKind::PopUp,
+            kind: WindowKind::Normal,
             ..Default::default()
         };
 
@@ -110,7 +110,7 @@ impl GroupDialog {
         let window_options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                 None,
-                size(px(380.0), px(280.0)),
+                size(px(400.0), px(300.0)),
                 cx,
             ))),
             titlebar: Some(TitlebarOptions {
@@ -118,7 +118,7 @@ impl GroupDialog {
                 appears_transparent: false,
                 ..Default::default()
             }),
-            kind: WindowKind::PopUp,
+            kind: WindowKind::Normal,
             ..Default::default()
         };
 

@@ -161,7 +161,7 @@ impl SessionDialog {
         let window_options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                 None,
-                size(px(420.0), px(520.0)),
+                size(px(450.0), px(580.0)),
                 cx,
             ))),
             titlebar: Some(TitlebarOptions {
@@ -169,7 +169,7 @@ impl SessionDialog {
                 appears_transparent: false,
                 ..Default::default()
             }),
-            kind: WindowKind::PopUp,
+            kind: WindowKind::Normal,
             ..Default::default()
         };
 
@@ -184,7 +184,7 @@ impl SessionDialog {
         let window_options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                 None,
-                size(px(420.0), px(520.0)),
+                size(px(450.0), px(580.0)),
                 cx,
             ))),
             titlebar: Some(TitlebarOptions {
@@ -192,7 +192,7 @@ impl SessionDialog {
                 appears_transparent: false,
                 ..Default::default()
             }),
-            kind: WindowKind::PopUp,
+            kind: WindowKind::Normal,
             ..Default::default()
         };
 

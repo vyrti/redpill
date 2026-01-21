@@ -289,17 +289,11 @@ impl Terminal {
     ///
     /// This sends user keyboard input to the shell/remote process.
     pub fn write(&self, data: &[u8]) {
-        eprintln!("[TERM WRITE] {} bytes: {:?}", data.len(), data);
         match &self.mode {
             TerminalMode2::Local { notifier } => {
-                // For local terminals, use Notify trait like Zed does
-                eprintln!("[TERM WRITE] Calling notifier.notify() for local terminal");
                 notifier.notify(data.to_vec());
-                eprintln!("[TERM WRITE] notifier.notify() completed");
             }
             TerminalMode2::Remote { backend, tokio_handle, .. } => {
-                // For SSH terminals, send to SSH backend
-                eprintln!("[TERM WRITE] Spawning async task for remote terminal");
                 let backend = backend.clone();
                 let data = data.to_vec();
                 tokio_handle.spawn(async move {

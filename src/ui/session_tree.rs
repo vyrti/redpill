@@ -4,9 +4,10 @@ use std::collections::HashSet;
 use uuid::Uuid;
 
 use crate::app::AppState;
-use crate::session::{Session, SessionGroup};
+use crate::session::{Session, SessionGroup, SshSession};
 use super::session_dialog::SessionDialog;
 use super::group_dialog::GroupDialog;
+use super::delete_confirm_dialog::DeleteConfirmDialog;
 
 /// Actions for the session tree
 #[derive(Clone, Debug)]
@@ -71,6 +72,19 @@ pub enum TreeItem {
     Session(Uuid),
 }
 
+/// Context menu target
+#[derive(Clone, Debug)]
+enum ContextMenuTarget {
+    Group { id: Uuid, name: String },
+    Session { id: Uuid, name: String },
+}
+
+/// State for an open context menu
+struct ContextMenuState {
+    position: Point<Pixels>,
+    target: ContextMenuTarget,
+}
+
 /// Cached data for rendering the tree
 struct TreeRenderData {
     groups: Vec<SessionGroup>,
@@ -100,6 +114,11 @@ pub struct SessionTree {
     state: SessionTreeState,
     pending_new_session_group: Option<Uuid>,
     pending_new_group_parent: Option<Uuid>,
+    pending_edit_session: Option<Uuid>,
+    pending_edit_group: Option<Uuid>,
+    pending_delete_session: Option<(Uuid, String)>,
+    pending_delete_group: Option<(Uuid, String)>,
+    context_menu: Option<ContextMenuState>,
 }
 
 impl SessionTree {
@@ -108,6 +127,11 @@ impl SessionTree {
             state: SessionTreeState::new(),
             pending_new_session_group: None,
             pending_new_group_parent: None,
+            pending_edit_session: None,
+            pending_edit_group: None,
+            pending_delete_session: None,
+            pending_delete_group: None,
+            context_menu: None,
         }
     }
 
@@ -159,6 +183,49 @@ impl SessionTree {
         cx.notify();
     }
 
+    /// Request edit session dialog
+    fn request_edit_session(&mut self, session_id: Uuid, cx: &mut Context<Self>) {
+        tracing::info!("request_edit_session called for: {}", session_id);
+        self.pending_edit_session = Some(session_id);
+        self.context_menu = None;
+        cx.notify();
+    }
+
+    /// Request edit group dialog
+    fn request_edit_group(&mut self, group_id: Uuid, cx: &mut Context<Self>) {
+        tracing::info!("request_edit_group called for: {}", group_id);
+        self.pending_edit_group = Some(group_id);
+        self.context_menu = None;
+        cx.notify();
+    }
+
+    /// Request delete session confirmation
+    fn request_delete_session(&mut self, id: Uuid, name: String, cx: &mut Context<Self>) {
+        self.pending_delete_session = Some((id, name));
+        self.context_menu = None;
+        cx.notify();
+    }
+
+    /// Request delete group confirmation
+    fn request_delete_group(&mut self, id: Uuid, name: String, cx: &mut Context<Self>) {
+        self.pending_delete_group = Some((id, name));
+        self.context_menu = None;
+        cx.notify();
+    }
+
+    /// Show context menu for a target
+    fn show_context_menu(&mut self, position: Point<Pixels>, target: ContextMenuTarget, cx: &mut Context<Self>) {
+        tracing::info!("show_context_menu called at position: {:?}, target: {:?}", position, target);
+        self.context_menu = Some(ContextMenuState { position, target });
+        cx.notify();
+    }
+
+    /// Close context menu
+    fn close_context_menu(&mut self, cx: &mut Context<Self>) {
+        self.context_menu = None;
+        cx.notify();
+    }
+
     fn render_group_header(
         &self,
         group: &SessionGroup,
@@ -167,10 +234,13 @@ impl SessionTree {
     ) -> impl IntoElement {
         let group_id = group.id;
         let group_name = group.name.clone();
+        let group_name_for_menu = group.name.clone();
+        let group_name_for_delete = group.name.clone();
         let group_color = group.color.clone();
 
         div()
             .id(ElementId::Name(format!("group-{}", group_id).into()))
+            .group("group-row")
             .flex()
             .items_center()
             .justify_between()
@@ -183,8 +253,10 @@ impl SessionTree {
             .on_click(cx.listener(move |this, _event, _window, cx| {
                 this.handle_toggle_group(group_id, cx);
             }))
-            .on_mouse_down(MouseButton::Right, cx.listener(move |this, _event, _window, cx| {
-                this.handle_mass_connect(group_id, cx);
+            .on_mouse_up(MouseButton::Right, cx.listener(move |this, event: &MouseUpEvent, _window, cx| {
+                cx.stop_propagation();
+                let target = ContextMenuTarget::Group { id: group_id, name: group_name_for_menu.clone() };
+                this.show_context_menu(event.position, target, cx);
             }))
             .child(
                 div()
@@ -215,6 +287,40 @@ impl SessionTree {
                 div()
                     .flex()
                     .gap_1()
+                    .opacity(0.0)
+                    .group_hover("group-row", |this| this.opacity(1.0))
+                    // Edit button
+                    .child(
+                        div()
+                            .id(ElementId::Name(format!("group-edit-{}", group_id).into()))
+                            .px_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_xs()
+                            .text_color(rgb(0x6c7086))
+                            .hover(|style| style.bg(rgb(0x45475a)).text_color(rgb(0xf9e2af)))
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                cx.stop_propagation();
+                                this.request_edit_group(group_id, cx);
+                            }))
+                            .child("✏"),
+                    )
+                    // Delete button
+                    .child(
+                        div()
+                            .id(ElementId::Name(format!("group-delete-{}", group_id).into()))
+                            .px_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_xs()
+                            .text_color(rgb(0x6c7086))
+                            .hover(|style| style.bg(rgb(0x45475a)).text_color(rgb(0xf38ba8)))
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                cx.stop_propagation();
+                                this.request_delete_group(group_id, group_name_for_delete.clone(), cx);
+                            }))
+                            .child("🗑"),
+                    )
                     // Connect All button for this group
                     .child(
                         div()
@@ -226,6 +332,7 @@ impl SessionTree {
                             .text_color(rgb(0x6c7086))
                             .hover(|style| style.bg(rgb(0x45475a)).text_color(rgb(0xa6e3a1)))
                             .on_click(cx.listener(move |this, _event, _window, cx| {
+                                cx.stop_propagation();
                                 this.handle_mass_connect(group_id, cx);
                             }))
                             .child(">>"),
@@ -241,6 +348,7 @@ impl SessionTree {
                             .text_color(rgb(0x6c7086))
                             .hover(|style| style.bg(rgb(0x45475a)).text_color(rgb(0x89b4fa)))
                             .on_click(cx.listener(move |this, _event, _window, cx| {
+                                cx.stop_propagation();
                                 this.request_new_session(Some(group_id), cx);
                             }))
                             .child("+"),
@@ -256,15 +364,20 @@ impl SessionTree {
     ) -> impl IntoElement {
         let session_id = session.id();
         let session_name = session.name().to_string();
+        let session_name_for_menu = session.name().to_string();
+        let session_name_for_delete = session.name().to_string();
         let icon = match session {
             Session::Ssh(_) => "🖥️",
             Session::Local(_) => "💻",
         };
+        let group_id = format!("session-row-{}", session_id);
 
         div()
             .id(ElementId::Name(format!("session-{}", session_id).into()))
+            .group(SharedString::from(group_id.clone()))
             .flex()
             .items_center()
+            .justify_between()
             .gap_1()
             .px_2()
             .py_1()
@@ -275,13 +388,249 @@ impl SessionTree {
             .on_click(cx.listener(move |this, _event, _window, cx| {
                 this.handle_open_session(session_id, cx);
             }))
-            .child(div().text_sm().child(icon))
+            .on_mouse_up(MouseButton::Right, cx.listener(move |this, event: &MouseUpEvent, _window, cx| {
+                cx.stop_propagation();
+                let target = ContextMenuTarget::Session { id: session_id, name: session_name_for_menu.clone() };
+                this.show_context_menu(event.position, target, cx);
+            }))
             .child(
                 div()
-                    .text_sm()
-                    .text_color(rgb(0xcdd6f4))
-                    .child(session_name),
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(div().text_sm().child(icon))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0xcdd6f4))
+                            .child(session_name),
+                    ),
             )
+            .child(
+                div()
+                    .flex()
+                    .gap_1()
+                    .opacity(0.0)
+                    .group_hover(SharedString::from(group_id), |this| this.opacity(1.0))
+                    // Edit button
+                    .child(
+                        div()
+                            .id(ElementId::Name(format!("session-edit-{}", session_id).into()))
+                            .px_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_xs()
+                            .text_color(rgb(0x6c7086))
+                            .hover(|style| style.bg(rgb(0x45475a)).text_color(rgb(0xf9e2af)))
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                cx.stop_propagation();
+                                this.request_edit_session(session_id, cx);
+                            }))
+                            .child("✏"),
+                    )
+                    // Delete button
+                    .child(
+                        div()
+                            .id(ElementId::Name(format!("session-delete-{}", session_id).into()))
+                            .px_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_xs()
+                            .text_color(rgb(0x6c7086))
+                            .hover(|style| style.bg(rgb(0x45475a)).text_color(rgb(0xf38ba8)))
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                cx.stop_propagation();
+                                this.request_delete_session(session_id, session_name_for_delete.clone(), cx);
+                            }))
+                            .child("🗑"),
+                    ),
+            )
+    }
+
+    fn render_context_menu(&self, menu: &ContextMenuState, cx: &mut Context<Self>) -> impl IntoElement {
+        // Clamp position to stay within panel bounds (250px wide panel, 160px menu)
+        let menu_width = px(160.0);
+        let panel_width = px(250.0);
+        let max_x = panel_width - menu_width - px(8.0);
+        let x = if menu.position.x > max_x {
+            max_x
+        } else {
+            menu.position.x
+        };
+        let y = menu.position.y;
+
+        match &menu.target {
+            ContextMenuTarget::Group { id, name } => {
+                let group_id = *id;
+                let group_name_delete = name.clone();
+
+                div()
+                    .absolute()
+                    .left(x)
+                    .top(y)
+                    .w(px(160.0))
+                    .bg(rgb(0x313244))
+                    .border_1()
+                    .border_color(rgb(0x45475a))
+                    .rounded_md()
+                    .shadow_lg()
+                    .py_1()
+                    .child(
+                        div()
+                            .id("ctx-edit-group")
+                            .px_3()
+                            .py_1()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(0x45475a)))
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                this.request_edit_group(group_id, cx);
+                            }))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(0xcdd6f4))
+                                    .child("Edit Group"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("ctx-connect-all")
+                            .px_3()
+                            .py_1()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(0x45475a)))
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                this.handle_mass_connect(group_id, cx);
+                                this.close_context_menu(cx);
+                            }))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(0xcdd6f4))
+                                    .child("Connect All"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("ctx-add-session")
+                            .px_3()
+                            .py_1()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(0x45475a)))
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                this.request_new_session(Some(group_id), cx);
+                                this.close_context_menu(cx);
+                            }))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(0xcdd6f4))
+                                    .child("Add Session"),
+                            ),
+                    )
+                    // Separator
+                    .child(
+                        div()
+                            .h(px(1.0))
+                            .mx_2()
+                            .my_1()
+                            .bg(rgb(0x45475a)),
+                    )
+                    .child(
+                        div()
+                            .id("ctx-delete-group")
+                            .px_3()
+                            .py_1()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(0x45475a)))
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                this.request_delete_group(group_id, group_name_delete.clone(), cx);
+                            }))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(0xf38ba8))
+                                    .child("Delete Group"),
+                            ),
+                    )
+            }
+            ContextMenuTarget::Session { id, name } => {
+                let session_id = *id;
+                let session_name_delete = name.clone();
+
+                div()
+                    .absolute()
+                    .left(x)
+                    .top(y)
+                    .w(px(160.0))
+                    .bg(rgb(0x313244))
+                    .border_1()
+                    .border_color(rgb(0x45475a))
+                    .rounded_md()
+                    .shadow_lg()
+                    .py_1()
+                    .child(
+                        div()
+                            .id("ctx-connect")
+                            .px_3()
+                            .py_1()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(0x45475a)))
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                this.handle_open_session(session_id, cx);
+                                this.close_context_menu(cx);
+                            }))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(0xcdd6f4))
+                                    .child("Connect"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("ctx-edit-session")
+                            .px_3()
+                            .py_1()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(0x45475a)))
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                this.request_edit_session(session_id, cx);
+                            }))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(0xcdd6f4))
+                                    .child("Edit Session"),
+                            ),
+                    )
+                    // Separator
+                    .child(
+                        div()
+                            .h(px(1.0))
+                            .mx_2()
+                            .my_1()
+                            .bg(rgb(0x45475a)),
+                    )
+                    .child(
+                        div()
+                            .id("ctx-delete-session")
+                            .px_3()
+                            .py_1()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(0x45475a)))
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                this.request_delete_session(session_id, session_name_delete.clone(), cx);
+                            }))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(0xf38ba8))
+                                    .child("Delete Session"),
+                            ),
+                    )
+            }
+        }
     }
 
     fn render_tree_content(&self, data: &TreeRenderData, cx: &mut Context<Self>) -> Div {
@@ -370,6 +719,70 @@ impl Render for SessionTree {
             });
         }
 
+        // Handle pending edit session request
+        if let Some(session_id) = self.pending_edit_session.take() {
+            tracing::info!("Edit session requested for: {}", session_id);
+            let mut session_to_edit: Option<SshSession> = None;
+            if let Some(app_state) = cx.try_global::<AppState>() {
+                let app = app_state.app.lock();
+                if let Some(session) = app.session_manager.get_session(session_id) {
+                    tracing::info!("Found session: {:?}", session.name());
+                    if let Session::Ssh(ssh_session) = session {
+                        session_to_edit = Some(ssh_session.clone());
+                    } else {
+                        tracing::info!("Session is not SSH, skipping edit");
+                    }
+                } else {
+                    tracing::warn!("Session not found: {}", session_id);
+                }
+            } else {
+                tracing::warn!("AppState not available");
+            }
+            if let Some(session) = session_to_edit {
+                tracing::info!("Opening edit dialog for session");
+                cx.defer(move |cx| {
+                    SessionDialog::open_edit(&session, cx);
+                });
+            }
+        }
+
+        // Handle pending edit group request
+        if let Some(group_id) = self.pending_edit_group.take() {
+            tracing::info!("Edit group requested for: {}", group_id);
+            let mut group_to_edit: Option<SessionGroup> = None;
+            if let Some(app_state) = cx.try_global::<AppState>() {
+                let app = app_state.app.lock();
+                if let Some(group) = app.session_manager.get_group(group_id) {
+                    tracing::info!("Found group: {}", group.name);
+                    group_to_edit = Some(group.clone());
+                } else {
+                    tracing::warn!("Group not found: {}", group_id);
+                }
+            } else {
+                tracing::warn!("AppState not available");
+            }
+            if let Some(group) = group_to_edit {
+                tracing::info!("Opening edit dialog for group");
+                cx.defer(move |cx| {
+                    GroupDialog::open_edit(&group, cx);
+                });
+            }
+        }
+
+        // Handle pending delete session request
+        if let Some((id, name)) = self.pending_delete_session.take() {
+            cx.defer(move |cx| {
+                DeleteConfirmDialog::open_for_session(id, name, cx);
+            });
+        }
+
+        // Handle pending delete group request
+        if let Some((id, name)) = self.pending_delete_group.take() {
+            cx.defer(move |cx| {
+                DeleteConfirmDialog::open_for_group(id, name, cx);
+            });
+        }
+
         // Get data from app state (clone it to avoid borrow conflicts)
         let render_data = cx.try_global::<AppState>().map(|app_state| {
             let app = app_state.app.lock();
@@ -379,7 +792,14 @@ impl Render for SessionTree {
             }
         });
 
-        div()
+        // Check if context menu is open
+        let has_context_menu = self.context_menu.is_some();
+        if has_context_menu {
+            tracing::info!("Rendering with context menu open");
+        }
+
+        let mut root = div()
+            .relative()
             .flex()
             .flex_col()
             .w(px(250.0))
@@ -466,7 +886,30 @@ impl Render for SessionTree {
                             )
                         },
                     ),
-            )
+            );
+
+        // Add context menu if open
+        if has_context_menu {
+            // Invisible overlay to capture clicks outside the menu
+            root = root.child(
+                div()
+                    .id("context-menu-backdrop")
+                    .absolute()
+                    .inset_0()
+                    .on_mouse_up(MouseButton::Left, cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
+                        this.close_context_menu(cx);
+                    }))
+                    .on_mouse_up(MouseButton::Right, cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
+                        this.close_context_menu(cx);
+                    })),
+            );
+
+            if let Some(menu) = &self.context_menu {
+                root = root.child(self.render_context_menu(menu, cx));
+            }
+        }
+
+        root
     }
 }
 

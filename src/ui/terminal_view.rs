@@ -97,7 +97,6 @@ impl TerminalView {
         self.last_blink_toggle = Instant::now();
 
         let keystroke = &event.keystroke;
-        eprintln!("[KEY EVENT] key={:?} modifiers={:?}", keystroke.key, keystroke.modifiers);
 
         // Skip if platform modifier (Cmd on Mac) is pressed - those are usually shortcuts
         if keystroke.modifiers.platform {
@@ -113,7 +112,6 @@ impl TerminalView {
 
         // If we have an escape sequence, send it
         if let Some(escape_str) = escape_result {
-            eprintln!("[KEY] Sending escape sequence: {:?}", escape_str.as_bytes());
             let term = self.terminal.lock();
             term.write(escape_str.as_bytes());
             drop(term);
@@ -149,7 +147,6 @@ impl TerminalView {
         };
 
         if let Some(input) = input {
-            eprintln!("[KEY] Sending character input: {:?}", input.as_bytes());
             let term = self.terminal.lock();
             term.write(input.as_bytes());
             drop(term);
@@ -172,17 +169,6 @@ impl TerminalView {
         let term = self.terminal.lock();
         let mode = term.mode();
         let term_size = term.size();
-
-        // Debug: print mouse mode status and terminal size
-        eprintln!("[MOUSE] DOWN window_pos={:?} bounds_origin={:?} local_pos={:?}, term_size={}x{}, cell={}x{}, mode: REPORT_CLICK={}, SGR={}",
-            event.position,
-            bounds_origin,
-            local_position,
-            term_size.cols, term_size.rows,
-            f32::from(self.cell_width), f32::from(self.cell_height),
-            mode.contains(TermMode::MOUSE_REPORT_CLICK),
-            mode.contains(TermMode::SGR_MOUSE)
-        );
 
         // Check if terminal wants mouse events
         if mode.contains(TermMode::MOUSE_REPORT_CLICK)
@@ -214,7 +200,6 @@ impl TerminalView {
                 let cy_char = (32 + row.min(223)) as u8;
                 format!("\x1b[M{}{}{}", cb as char, cx_char as char, cy_char as char)
             };
-            eprintln!("[MOUSE] sending report: {:?} at col={} row={}", mouse_report.as_bytes(), col, row);
             term.write(mouse_report.as_bytes());
             drop(term);
             cx.notify();
@@ -288,7 +273,6 @@ impl TerminalView {
                 let cy_char = (32 + row.min(223)) as u8;
                 format!("\x1b[M{}{}{}", cb as char, cx_char as char, cy_char as char)
             };
-            eprintln!("[MOUSE] UP local_pos={:?} col={} row={}, sending: {:?}", local_position, col, row, mouse_report.as_bytes());
             term.write(mouse_report.as_bytes());
             drop(term);
             cx.notify();

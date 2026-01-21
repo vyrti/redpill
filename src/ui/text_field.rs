@@ -172,6 +172,7 @@ impl Render for TextField {
             .cursor_text()
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
                 let keystroke = &event.keystroke;
+                let is_cmd_or_ctrl = keystroke.modifiers.platform || keystroke.modifiers.control;
 
                 match keystroke.key.as_str() {
                     "backspace" => this.handle_backspace(cx),
@@ -180,7 +181,37 @@ impl Render for TextField {
                     "right" => this.move_right(cx),
                     "home" => this.move_to_start(cx),
                     "end" => this.move_to_end(cx),
-                    key if key.len() == 1 && !keystroke.modifiers.control && !keystroke.modifiers.alt => {
+                    "a" if is_cmd_or_ctrl => {
+                        // Select all - for now just move to end
+                        this.move_to_end(cx);
+                    }
+                    "v" if is_cmd_or_ctrl => {
+                        // Paste
+                        if let Some(item) = cx.read_from_clipboard() {
+                            if let Some(text) = item.text() {
+                                this.handle_input(&text, cx);
+                            }
+                        }
+                    }
+                    "c" if is_cmd_or_ctrl => {
+                        // Copy all content
+                        if !this.content.is_empty() {
+                            cx.write_to_clipboard(ClipboardItem::new_string(this.content.clone()));
+                        }
+                    }
+                    "x" if is_cmd_or_ctrl => {
+                        // Cut all content
+                        if !this.content.is_empty() {
+                            cx.write_to_clipboard(ClipboardItem::new_string(this.content.clone()));
+                            this.content.clear();
+                            this.cursor_pos = 0;
+                            if let Some(ref callback) = this.on_change {
+                                callback(&this.content, cx);
+                            }
+                            cx.notify();
+                        }
+                    }
+                    key if key.len() == 1 && !keystroke.modifiers.control && !keystroke.modifiers.platform && !keystroke.modifiers.alt => {
                         this.handle_input(key, cx);
                     }
                     _ => {}
@@ -197,7 +228,8 @@ impl Render for TextField {
                     .text_sm()
                     .overflow_hidden()
                     .when(!has_content, |this| {
-                        this.text_color(rgb(0x6c7086))
+                        this.text_color(rgb(0x585b70))
+                            .italic()
                             .child(placeholder)
                     })
                     .when(has_content, |this| {
