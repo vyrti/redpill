@@ -23,6 +23,10 @@ pub struct TerminalView {
     /// Cell dimensions for mouse coordinate conversion
     cell_width: Pixels,
     cell_height: Pixels,
+    /// View bounds origin for mouse coordinate conversion
+    /// Mouse events in GPUI are in window coordinates, so we need to subtract the origin
+    /// This is shared with the canvas callback via Arc so it can be updated during paint
+    bounds_origin: Arc<Mutex<Point<Pixels>>>,
     /// Whether mouse is currently selecting
     is_selecting: bool,
     /// Cursor blink state - true means cursor is visible in the blink cycle
@@ -74,6 +78,7 @@ impl TerminalView {
             font_size: px(14.0),
             cell_width: px(8.0),
             cell_height: px(14.0),
+            bounds_origin: Arc::new(Mutex::new(point(px(0.0), px(0.0)))),
             is_selecting: false,
             cursor_visible: true,
             last_blink_toggle: Instant::now(),
@@ -92,6 +97,7 @@ impl TerminalView {
         self.last_blink_toggle = Instant::now();
 
         let keystroke = &event.keystroke;
+        eprintln!("[KEY EVENT] key={:?} modifiers={:?}", keystroke.key, keystroke.modifiers);
 
         // Skip if platform modifier (Cmd on Mac) is pressed - those are usually shortcuts
         if keystroke.modifiers.platform {
@@ -107,6 +113,7 @@ impl TerminalView {
 
         // If we have an escape sequence, send it
         if let Some(escape_str) = escape_result {
+            eprintln!("[KEY] Sending escape sequence: {:?}", escape_str.as_bytes());
             let term = self.terminal.lock();
             term.write(escape_str.as_bytes());
             drop(term);
@@ -142,6 +149,7 @@ impl TerminalView {
         };
 
         if let Some(input) = input {
+            eprintln!("[KEY] Sending character input: {:?}", input.as_bytes());
             let term = self.terminal.lock();
             term.write(input.as_bytes());
             drop(term);
@@ -154,15 +162,25 @@ impl TerminalView {
         // Focus on click
         cx.focus_self(window);
 
+        // Adjust mouse position from window coordinates to view-local coordinates
+        let bounds_origin = *self.bounds_origin.lock();
+        let local_position = point(
+            event.position.x - bounds_origin.x,
+            event.position.y - bounds_origin.y,
+        );
+
         let term = self.terminal.lock();
         let mode = term.mode();
+        let term_size = term.size();
 
-        // Debug: print mouse mode status
-        eprintln!("[MOUSE] click at {:?}, mode: REPORT_CLICK={}, DRAG={}, MOTION={}, SGR={}",
+        // Debug: print mouse mode status and terminal size
+        eprintln!("[MOUSE] DOWN window_pos={:?} bounds_origin={:?} local_pos={:?}, term_size={}x{}, cell={}x{}, mode: REPORT_CLICK={}, SGR={}",
             event.position,
+            bounds_origin,
+            local_position,
+            term_size.cols, term_size.rows,
+            f32::from(self.cell_width), f32::from(self.cell_height),
             mode.contains(TermMode::MOUSE_REPORT_CLICK),
-            mode.contains(TermMode::MOUSE_DRAG),
-            mode.contains(TermMode::MOUSE_MOTION),
             mode.contains(TermMode::SGR_MOUSE)
         );
 
@@ -171,8 +189,8 @@ impl TerminalView {
             || mode.contains(TermMode::MOUSE_DRAG)
             || mode.contains(TermMode::MOUSE_MOTION)
         {
-            // Send mouse event to terminal application
-            let point = self.mouse_to_point(event.position);
+            // Send mouse event to terminal application (use local coordinates)
+            let point = self.mouse_to_point(local_position);
             let button = match event.button {
                 MouseButton::Left => 0,
                 MouseButton::Middle => 1,
@@ -181,6 +199,10 @@ impl TerminalView {
             };
             let col = point.column.0 as u32 + 1; // 1-based
             let row = point.line.0 as u32 + 1; // 1-based
+
+            // Clamp coordinates to terminal dimensions (and ensure positive)
+            let col = col.max(1).min(term_size.cols as u32);
+            let row = row.max(1).min(term_size.rows as u32);
 
             // Use SGR mouse protocol if enabled, otherwise use normal protocol
             let mouse_report = if mode.contains(TermMode::SGR_MOUSE) {
@@ -213,8 +235,14 @@ impl TerminalView {
 
     fn handle_mouse_move(&mut self, event: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
         if self.is_selecting {
-            let point = self.mouse_to_point(event.position);
-            let side = self.mouse_to_side(event.position);
+            // Adjust mouse position from window coordinates to view-local coordinates
+            let bounds_origin = *self.bounds_origin.lock();
+            let local_position = point(
+                event.position.x - bounds_origin.x,
+                event.position.y - bounds_origin.y,
+            );
+            let point = self.mouse_to_point(local_position);
+            let side = self.mouse_to_side(local_position);
             let term = self.terminal.lock();
             term.update_selection(point, side);
             cx.notify();
@@ -222,24 +250,33 @@ impl TerminalView {
     }
 
     fn handle_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        // Adjust mouse position from window coordinates to view-local coordinates
+        let bounds_origin = *self.bounds_origin.lock();
+        let local_position = point(
+            event.position.x - bounds_origin.x,
+            event.position.y - bounds_origin.y,
+        );
+
         let term = self.terminal.lock();
         let mode = term.mode();
+        let term_size = term.size();
 
         // Check if terminal wants mouse events
         if mode.contains(TermMode::MOUSE_REPORT_CLICK)
             || mode.contains(TermMode::MOUSE_DRAG)
             || mode.contains(TermMode::MOUSE_MOTION)
         {
-            // Send mouse release event to terminal application
-            let point = self.mouse_to_point(event.position);
+            // Send mouse release event to terminal application (use local coordinates)
+            let point = self.mouse_to_point(local_position);
             let button = match event.button {
                 MouseButton::Left => 0,
                 MouseButton::Middle => 1,
                 MouseButton::Right => 2,
                 _ => 0,
             };
-            let col = point.column.0 as u32 + 1;
-            let row = point.line.0 as u32 + 1;
+            // Clamp coordinates to terminal dimensions (and ensure positive)
+            let col = (point.column.0 as u32 + 1).max(1).min(term_size.cols as u32);
+            let row = (point.line.0 as u32 + 1).max(1).min(term_size.rows as u32);
 
             // Use SGR mouse protocol for release (lowercase 'm')
             let mouse_report = if mode.contains(TermMode::SGR_MOUSE) {
@@ -251,6 +288,7 @@ impl TerminalView {
                 let cy_char = (32 + row.min(223)) as u8;
                 format!("\x1b[M{}{}{}", cb as char, cx_char as char, cy_char as char)
             };
+            eprintln!("[MOUSE] UP local_pos={:?} col={} row={}, sending: {:?}", local_position, col, row, mouse_report.as_bytes());
             term.write(mouse_report.as_bytes());
             drop(term);
             cx.notify();
@@ -263,6 +301,13 @@ impl TerminalView {
     }
 
     fn handle_scroll(&mut self, event: &ScrollWheelEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        // Adjust mouse position from window coordinates to view-local coordinates
+        let bounds_origin = *self.bounds_origin.lock();
+        let local_position = point(
+            event.position.x - bounds_origin.x,
+            event.position.y - bounds_origin.y,
+        );
+
         let term = self.terminal.lock();
         let mode = term.mode();
 
@@ -285,9 +330,11 @@ impl TerminalView {
             };
 
             if lines != 0 {
-                let point = self.mouse_to_point(event.position);
-                let col = point.column.0 as u32 + 1;
-                let row = point.line.0 as u32 + 1;
+                let point = self.mouse_to_point(local_position);
+                let term_size = term.size();
+                // Clamp coordinates to terminal dimensions (and ensure positive)
+                let col = (point.column.0 as u32 + 1).max(1).min(term_size.cols as u32);
+                let row = (point.line.0 as u32 + 1).max(1).min(term_size.rows as u32);
 
                 // Button 64 = scroll up, 65 = scroll down
                 let button = if lines < 0 { 64 } else { 65 };
@@ -463,6 +510,9 @@ impl Render for TerminalView {
         // Cursor is visible if blink state is true, or if we're not focused (hollow cursor always visible)
         let cursor_blink_visible = self.cursor_visible || !focused;
 
+        // Clone bounds_origin for the canvas callback
+        let bounds_origin_for_canvas = self.bounds_origin.clone();
+
         div()
             .size_full()
             .bg(rgb(0x1e1e2e))
@@ -476,7 +526,11 @@ impl Render for TerminalView {
                 canvas(
                     {
                         let terminal = terminal.clone();
+                        let bounds_origin = bounds_origin_for_canvas.clone();
                         move |bounds, window, _cx| {
+                            // Update bounds origin for mouse coordinate conversion
+                            *bounds_origin.lock() = bounds.origin;
+
                             let terminal = terminal.lock();
                             let colors = terminal.colors();
                             let cursor_pos = terminal.cursor_position();
