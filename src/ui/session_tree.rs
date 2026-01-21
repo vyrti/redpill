@@ -126,6 +126,19 @@ impl SessionTree {
         cx.notify();
     }
 
+    /// Handle mass connect for a group
+    fn handle_mass_connect(&mut self, group_id: Uuid, cx: &mut Context<Self>) {
+        if let Some(app_state) = cx.try_global::<AppState>() {
+            let results = app_state.app.lock().mass_connect(group_id);
+            for result in results {
+                if let Err(e) = result {
+                    tracing::error!("Mass connect error: {}", e);
+                }
+            }
+        }
+        cx.notify();
+    }
+
     /// Handle clicking the new session button - just set flag for later
     fn request_new_session(&mut self, group_id: Option<Uuid>, cx: &mut Context<Self>) {
         if let Some(gid) = group_id {
@@ -168,6 +181,9 @@ impl SessionTree {
             .on_click(cx.listener(move |this, _event, _window, cx| {
                 this.handle_toggle_group(group_id, cx);
             }))
+            .on_mouse_down(MouseButton::Right, cx.listener(move |this, _event, _window, cx| {
+                this.handle_mass_connect(group_id, cx);
+            }))
             .child(
                 div()
                     .flex()
@@ -194,19 +210,39 @@ impl SessionTree {
                     ),
             )
             .child(
-                // Add session button for this group
                 div()
-                    .id(ElementId::Name(format!("group-add-{}", group_id).into()))
-                    .px_1()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .text_xs()
-                    .text_color(rgb(0x6c7086))
-                    .hover(|style| style.bg(rgb(0x45475a)).text_color(rgb(0x89b4fa)))
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.request_new_session(Some(group_id), cx);
-                    }))
-                    .child("+"),
+                    .flex()
+                    .gap_1()
+                    // Connect All button for this group
+                    .child(
+                        div()
+                            .id(ElementId::Name(format!("group-connect-all-{}", group_id).into()))
+                            .px_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_xs()
+                            .text_color(rgb(0x6c7086))
+                            .hover(|style| style.bg(rgb(0x45475a)).text_color(rgb(0xa6e3a1)))
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                this.handle_mass_connect(group_id, cx);
+                            }))
+                            .child(">>"),
+                    )
+                    // Add session button for this group
+                    .child(
+                        div()
+                            .id(ElementId::Name(format!("group-add-{}", group_id).into()))
+                            .px_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_xs()
+                            .text_color(rgb(0x6c7086))
+                            .hover(|style| style.bg(rgb(0x45475a)).text_color(rgb(0x89b4fa)))
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                this.request_new_session(Some(group_id), cx);
+                            }))
+                            .child("+"),
+                    ),
             )
     }
 

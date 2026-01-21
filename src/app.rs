@@ -123,13 +123,20 @@ impl RedPillApp {
 
         tokio::spawn(async move {
             // Connect to SSH server
-            {
+            let connect_result = {
                 let mut backend = backend_for_connect.lock().await;
-                if let Err(e) = backend.connect().await {
+                backend.connect().await
+            };
+
+            match connect_result {
+                Ok(()) => {
+                    tracing::info!("SSH connection established");
+                }
+                Err(e) => {
                     tracing::error!("SSH connection failed: {}", e);
+                    // TODO: Notify UI of connection failure
                     return;
                 }
-                tracing::info!("SSH connection established");
             }
 
             // Start reading from SSH and feeding to terminal

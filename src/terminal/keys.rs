@@ -49,6 +49,9 @@ pub fn keystroke_to_escape(
     mode: &TermMode,
     option_as_meta: bool,
 ) -> Option<Cow<'static, str>> {
+    // Debug logging for key events
+    eprintln!("[KEY] key='{}' modifiers={:?}", keystroke.key, keystroke.modifiers);
+
     let modifiers = Modifiers::from_keystroke(keystroke);
 
     // Handle special keys with specific modifier combinations
@@ -107,6 +110,14 @@ pub fn keystroke_to_escape(
         ("f10", Modifiers::None) => Some("\x1b[21~"),
         ("f11", Modifiers::None) => Some("\x1b[23~"),
         ("f12", Modifiers::None) => Some("\x1b[24~"),
+        ("f13", Modifiers::None) => Some("\x1b[25~"),
+        ("f14", Modifiers::None) => Some("\x1b[26~"),
+        ("f15", Modifiers::None) => Some("\x1b[28~"),
+        ("f16", Modifiers::None) => Some("\x1b[29~"),
+        ("f17", Modifiers::None) => Some("\x1b[31~"),
+        ("f18", Modifiers::None) => Some("\x1b[32~"),
+        ("f19", Modifiers::None) => Some("\x1b[33~"),
+        ("f20", Modifiers::None) => Some("\x1b[34~"),
 
         // Ctrl+letter combinations (caret notation)
         ("a", Modifiers::Ctrl) | ("A", Modifiers::CtrlShift) => Some("\x01"),
@@ -172,6 +183,14 @@ pub fn keystroke_to_escape(
             "f10" => Some(format!("\x1b[21;{}~", modifier_code)),
             "f11" => Some(format!("\x1b[23;{}~", modifier_code)),
             "f12" => Some(format!("\x1b[24;{}~", modifier_code)),
+            "f13" => Some(format!("\x1b[25;{}~", modifier_code)),
+            "f14" => Some(format!("\x1b[26;{}~", modifier_code)),
+            "f15" => Some(format!("\x1b[28;{}~", modifier_code)),
+            "f16" => Some(format!("\x1b[29;{}~", modifier_code)),
+            "f17" => Some(format!("\x1b[31;{}~", modifier_code)),
+            "f18" => Some(format!("\x1b[32;{}~", modifier_code)),
+            "f19" => Some(format!("\x1b[33;{}~", modifier_code)),
+            "f20" => Some(format!("\x1b[34;{}~", modifier_code)),
             _ if modifier_code == 2 => None, // Shift-only, don't apply for non-navigation keys
             "insert" => Some(format!("\x1b[2;{}~", modifier_code)),
             "delete" => Some(format!("\x1b[3;{}~", modifier_code)),
