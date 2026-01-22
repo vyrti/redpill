@@ -503,19 +503,22 @@ impl SshBackend {
         }
     }
 
-    /// Authenticate using SSH agent
+    /// Authenticate using SSH agent (Unix implementation)
+    #[cfg(unix)]
     async fn authenticate_with_agent(
         &self,
         session: &mut Handle<SshClientHandler>,
         username: &str,
     ) -> SshResult<bool> {
+        use russh_keys::agent::client::AgentClient;
+
         // Get the SSH_AUTH_SOCK environment variable
         let socket_path = std::env::var("SSH_AUTH_SOCK").map_err(|_| {
             SshError::AuthenticationFailed("SSH_AUTH_SOCK not set".to_string())
         })?;
 
         // Connect to the agent
-        let mut agent = russh_keys::agent::client::AgentClient::connect_uds(&socket_path)
+        let mut agent = AgentClient::connect_uds(&socket_path)
             .await
             .map_err(|e| SshError::AuthenticationFailed(format!("Failed to connect to agent: {}", e)))?;
 
@@ -526,6 +529,108 @@ impl SshBackend {
             .map_err(|e| SshError::AuthenticationFailed(format!("Failed to get identities: {}", e)))?;
 
         // Try each identity using authenticate_future with the agent as signer
+        for identity in identities {
+            let (returned_agent, result) = session
+                .authenticate_future(username, identity, agent)
+                .await;
+            agent = returned_agent;
+
+            match result {
+                Ok(true) => return Ok(true),
+                Ok(false) => continue,
+                Err(_) => continue,
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Authenticate using SSH agent (Windows implementation)
+    ///
+    /// Tries OpenSSH agent first (via named pipe), then falls back to Pageant.
+    #[cfg(windows)]
+    async fn authenticate_with_agent(
+        &self,
+        session: &mut Handle<SshClientHandler>,
+        username: &str,
+    ) -> SshResult<bool> {
+        use russh_keys::agent::client::AgentClient;
+
+        // Try Windows OpenSSH agent via named pipe first
+        if let Some(result) = self.try_openssh_agent(session, username).await {
+            return result;
+        }
+
+        // Fall back to Pageant
+        self.try_pageant_agent(session, username).await
+    }
+
+    /// Try to authenticate using Windows OpenSSH agent (named pipe)
+    #[cfg(windows)]
+    async fn try_openssh_agent(
+        &self,
+        session: &mut Handle<SshClientHandler>,
+        username: &str,
+    ) -> Option<SshResult<bool>> {
+        use russh_keys::agent::client::AgentClient;
+
+        // Try SSH_AUTH_SOCK first, then default pipe
+        let pipe_path = std::env::var("SSH_AUTH_SOCK")
+            .ok()
+            .unwrap_or_else(|| r"\\.\pipe\openssh-ssh-agent".to_string());
+
+        let mut agent = match AgentClient::connect_named_pipe(&pipe_path).await {
+            Ok(a) => a,
+            Err(_) => {
+                // Try default pipe if SSH_AUTH_SOCK didn't work
+                if pipe_path != r"\\.\pipe\openssh-ssh-agent" {
+                    match AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent").await {
+                        Ok(a) => a,
+                        Err(_) => return None,
+                    }
+                } else {
+                    return None;
+                }
+            }
+        };
+
+        let identities = match agent.request_identities().await {
+            Ok(ids) => ids,
+            Err(_) => return None,
+        };
+
+        for identity in identities {
+            let (returned_agent, result) = session
+                .authenticate_future(username, identity, agent)
+                .await;
+            agent = returned_agent;
+
+            match result {
+                Ok(true) => return Some(Ok(true)),
+                Ok(false) => continue,
+                Err(_) => continue,
+            }
+        }
+
+        Some(Ok(false))
+    }
+
+    /// Try to authenticate using Pageant SSH agent
+    #[cfg(windows)]
+    async fn try_pageant_agent(
+        &self,
+        session: &mut Handle<SshClientHandler>,
+        username: &str,
+    ) -> SshResult<bool> {
+        use russh_keys::agent::client::AgentClient;
+
+        let mut agent = AgentClient::connect_pageant().await;
+
+        let identities = agent
+            .request_identities()
+            .await
+            .map_err(|e| SshError::AuthenticationFailed(format!("Failed to get identities from Pageant: {}", e)))?;
+
         for identity in identities {
             let (returned_agent, result) = session
                 .authenticate_future(username, identity, agent)

@@ -90,7 +90,7 @@ impl TerminalView {
         Self {
             terminal,
             focus_handle,
-            font_family: "Monaco".into(),
+            font_family: default_terminal_font().into(),
             font_size: px(14.0),
             cell_width: px(8.0),
             cell_height: px(14.0),
@@ -991,4 +991,29 @@ impl Render for TerminalView {
 
 pub fn terminal_view(terminal: Arc<Mutex<Terminal>>, color_scheme: Option<String>, _window: &mut Window, cx: &mut App) -> Entity<TerminalView> {
     cx.new(|cx| TerminalView::new(terminal, color_scheme, cx))
+}
+
+/// Returns the default terminal font for the current platform.
+///
+/// Tries to use beautiful, widely-available monospace fonts:
+/// - Windows: Cascadia Code (ships with Windows Terminal), falls back to Consolas
+/// - macOS: SF Mono (system font), falls back to Monaco
+/// - Linux: JetBrains Mono, falls back to Ubuntu Mono or DejaVu Sans Mono
+fn default_terminal_font() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        "Cascadia Code"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "SF Mono"
+    }
+    #[cfg(target_os = "linux")]
+    {
+        "JetBrains Mono"
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        "monospace"
+    }
 }

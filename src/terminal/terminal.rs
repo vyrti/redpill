@@ -235,10 +235,15 @@ impl Terminal {
         let term = Arc::new(FairMutex::new(term));
 
         // Create PTY options (we still need a PTY for the EventLoop, but it won't be used for SSH data)
-        // Use 'cat' as a null placeholder - it blocks waiting for stdin and consumes no resources.
+        // Use a null placeholder that blocks waiting for stdin and consumes no resources.
         // SSH data is fed directly via the VT processor, bypassing this dummy PTY entirely.
+        #[cfg(windows)]
+        let dummy_shell = tty::Shell::new("cmd.exe".to_string(), vec!["/c".to_string(), "pause>nul".to_string()]);
+        #[cfg(not(windows))]
+        let dummy_shell = tty::Shell::new("/bin/cat".to_string(), vec![]);
+
         let pty_config = PtyOptions {
-            shell: Some(tty::Shell::new("/bin/cat".to_string(), vec![])),
+            shell: Some(dummy_shell),
             working_directory: None,
             hold: false,
             env: HashMap::new(),
@@ -307,10 +312,15 @@ impl Terminal {
         let term = Arc::new(FairMutex::new(term));
 
         // Create PTY options (we still need a PTY for the EventLoop, but it won't be used for SSM data)
-        // Use 'cat' as a null placeholder - it blocks waiting for stdin and consumes no resources.
+        // Use a null placeholder that blocks waiting for stdin and consumes no resources.
         // SSM data is fed directly via the VT processor, bypassing this dummy PTY entirely.
+        #[cfg(windows)]
+        let dummy_shell = tty::Shell::new("cmd.exe".to_string(), vec!["/c".to_string(), "pause>nul".to_string()]);
+        #[cfg(not(windows))]
+        let dummy_shell = tty::Shell::new("/bin/cat".to_string(), vec![]);
+
         let pty_config = PtyOptions {
-            shell: Some(tty::Shell::new("/bin/cat".to_string(), vec![])),
+            shell: Some(dummy_shell),
             working_directory: None,
             hold: false,
             env: HashMap::new(),
