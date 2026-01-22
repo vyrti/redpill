@@ -363,6 +363,22 @@ impl SessionTree {
                                 this.request_new_session(Some(group_id), cx);
                             }))
                             .child("+"),
+                    )
+                    // Add sub-group button
+                    .child(
+                        div()
+                            .id(ElementId::Name(format!("group-add-subgroup-{}", group_id).into()))
+                            .px_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_xs()
+                            .text_color(rgb(0x6c7086))
+                            .hover(|style| style.bg(rgb(0x45475a)).text_color(rgb(0xa6e3a1)))
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                cx.stop_propagation();
+                                this.request_new_group(Some(group_id), cx);
+                            }))
+                            .child("📁+"),
                     ),
             )
     }
@@ -540,6 +556,24 @@ impl SessionTree {
                                     .child("Add Session"),
                             ),
                     )
+                    .child(
+                        div()
+                            .id("ctx-add-subgroup")
+                            .px_3()
+                            .py_1()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(0x45475a)))
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                this.request_new_group(Some(group_id), cx);
+                                this.close_context_menu(cx);
+                            }))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(0xcdd6f4))
+                                    .child("Add Sub-group"),
+                            ),
+                    )
                     // Separator
                     .child(
                         div()
@@ -645,45 +679,49 @@ impl SessionTree {
         }
     }
 
+    /// Recursively render a group and all its descendants
+    fn render_group_recursive(
+        &self,
+        data: &TreeRenderData,
+        group: &SessionGroup,
+        depth: usize,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let is_expanded = self.state.is_expanded(group.id);
+        let group_id = group.id;
+        let group_indent = (depth as f32) * 12.0;
+        let session_indent = group_indent + 16.0;
+
+        let mut container = div().flex().flex_col();
+
+        // Render group header with indent
+        container = container.child(
+            div()
+                .ml(px(group_indent))
+                .child(self.render_group_header(group, is_expanded, cx)),
+        );
+
+        if is_expanded {
+            // Render sessions in this group
+            for session in data.sessions_in_group(group_id) {
+                container = container.child(self.render_session_item(session, session_indent, cx));
+            }
+
+            // Recursively render child groups
+            for child_group in data.child_groups(group_id) {
+                container = container.child(self.render_group_recursive(data, child_group, depth + 1, cx));
+            }
+        }
+
+        container
+    }
+
     fn render_tree_content(&self, data: &TreeRenderData, cx: &mut Context<Self>) -> Div {
         let mut content = div().flex().flex_col().gap_1();
 
-        // Render top-level groups
+        // Render top-level groups recursively
         for group in data.top_level_groups() {
-            let is_expanded = self.state.is_expanded(group.id);
-            let group_id = group.id;
-
-            content = content.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .child(self.render_group_header(group, is_expanded, cx)),
-            );
-
-            if is_expanded {
-                // Render sessions in this group
-                for session in data.sessions_in_group(group_id) {
-                    content = content.child(self.render_session_item(session, 16.0, cx));
-                }
-
-                // Render child groups
-                for child_group in data.child_groups(group_id) {
-                    let child_expanded = self.state.is_expanded(child_group.id);
-                    let child_id = child_group.id;
-
-                    content = content.child(
-                        div()
-                            .ml(px(12.0))
-                            .child(self.render_group_header(child_group, child_expanded, cx)),
-                    );
-
-                    if child_expanded {
-                        for session in data.sessions_in_group(child_id) {
-                            content = content.child(self.render_session_item(session, 28.0, cx));
-                        }
-                    }
-                }
-            }
+            content = content.child(self.render_group_recursive(data, group, 0, cx));
         }
 
         // Render ungrouped sessions
