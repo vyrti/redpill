@@ -63,6 +63,10 @@ fn main() {
                         MenuItem::action("Zoom In", ZoomIn),
                         MenuItem::action("Zoom Out", ZoomOut),
                         MenuItem::action("Reset Zoom", ZoomReset),
+                        MenuItem::separator(),
+                        MenuItem::action("Theme: Default", SchemeDefault),
+                        MenuItem::action("Theme: Light", SchemeLight),
+                        MenuItem::action("Theme: Matrix", SchemeMatrix),
                     ],
                 },
             ]);
@@ -155,6 +159,36 @@ fn main() {
             cx.refresh_windows();
         });
 
+        // SchemeDefault - switch to default dark theme
+        cx.on_action(|_: &SchemeDefault, cx| {
+            if let Some(state) = cx.try_global::<AppState>() {
+                let mut app = state.app.lock();
+                app.config.appearance.set_scheme("default");
+                let _ = app.config.save();
+            }
+            cx.refresh_windows();
+        });
+
+        // SchemeLight - switch to light theme
+        cx.on_action(|_: &SchemeLight, cx| {
+            if let Some(state) = cx.try_global::<AppState>() {
+                let mut app = state.app.lock();
+                app.config.appearance.set_scheme("light");
+                let _ = app.config.save();
+            }
+            cx.refresh_windows();
+        });
+
+        // SchemeMatrix - switch to matrix theme
+        cx.on_action(|_: &SchemeMatrix, cx| {
+            if let Some(state) = cx.try_global::<AppState>() {
+                let mut app = state.app.lock();
+                app.config.appearance.set_scheme("matrix");
+                let _ = app.config.save();
+            }
+            cx.refresh_windows();
+        });
+
         // ShowSettings - placeholder for settings dialog
         cx.on_action(|_: &ShowSettings, _cx| {
             tracing::info!("Settings dialog not yet implemented");
@@ -187,5 +221,8 @@ actions!(
         ZoomIn,
         ZoomOut,
         ZoomReset,
+        SchemeDefault,
+        SchemeLight,
+        SchemeMatrix,
     ]
 );

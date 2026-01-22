@@ -78,7 +78,7 @@ impl Default for TerminalAppearance {
             min_font_size: 8.0,
             max_font_size: 32.0,
             line_height: 1.2,
-            theme: "dark".to_string(),
+            theme: "default".to_string(),
         }
     }
 }
@@ -97,6 +97,138 @@ impl TerminalAppearance {
     /// Reset zoom to default
     pub fn zoom_reset(&mut self) {
         self.font_size = 13.0;
+    }
+
+    /// Get the current color scheme
+    pub fn color_scheme(&self) -> ColorScheme {
+        ColorScheme::builtin(&self.theme).unwrap_or_else(ColorScheme::default_dark)
+    }
+
+    /// Set color scheme by name
+    pub fn set_scheme(&mut self, name: &str) {
+        if ColorScheme::builtin(name).is_some() {
+            self.theme = name.to_string();
+        }
+    }
+}
+
+/// Terminal color scheme
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ColorScheme {
+    pub name: String,
+    pub foreground: u32,
+    pub background: u32,
+    pub cursor: u32,
+    pub black: u32,
+    pub red: u32,
+    pub green: u32,
+    pub yellow: u32,
+    pub blue: u32,
+    pub magenta: u32,
+    pub cyan: u32,
+    pub white: u32,
+    pub bright_black: u32,
+    pub bright_red: u32,
+    pub bright_green: u32,
+    pub bright_yellow: u32,
+    pub bright_blue: u32,
+    pub bright_magenta: u32,
+    pub bright_cyan: u32,
+    pub bright_white: u32,
+}
+
+impl ColorScheme {
+    /// Get built-in scheme by name
+    pub fn builtin(name: &str) -> Option<Self> {
+        match name {
+            "default" => Some(Self::default_dark()),
+            "light" => Some(Self::light()),
+            "matrix" => Some(Self::matrix()),
+            _ => None,
+        }
+    }
+
+    /// Default dark theme (Catppuccin-like colors)
+    pub fn default_dark() -> Self {
+        Self {
+            name: "default".into(),
+            foreground: 0xcdd6f4,
+            background: 0x1e1e2e,
+            cursor: 0xf5e0dc,
+            black: 0x45475a,
+            red: 0xf38ba8,
+            green: 0xa6e3a1,
+            yellow: 0xf9e2af,
+            blue: 0x89b4fa,
+            magenta: 0xf5c2e7,
+            cyan: 0x94e2d5,
+            white: 0xbac2de,
+            bright_black: 0x585b70,
+            bright_red: 0xf38ba8,
+            bright_green: 0xa6e3a1,
+            bright_yellow: 0xf9e2af,
+            bright_blue: 0x89b4fa,
+            bright_magenta: 0xf5c2e7,
+            bright_cyan: 0x94e2d5,
+            bright_white: 0xa6adc8,
+        }
+    }
+
+    /// Light theme - black on white
+    pub fn light() -> Self {
+        Self {
+            name: "light".into(),
+            foreground: 0x000000,
+            background: 0xffffff,
+            cursor: 0x000000,
+            black: 0x000000,
+            red: 0xcd0000,
+            green: 0x00cd00,
+            yellow: 0xcdcd00,
+            blue: 0x0000ee,
+            magenta: 0xcd00cd,
+            cyan: 0x00cdcd,
+            white: 0xe5e5e5,
+            bright_black: 0x7f7f7f,
+            bright_red: 0xff0000,
+            bright_green: 0x00ff00,
+            bright_yellow: 0xffff00,
+            bright_blue: 0x5c5cff,
+            bright_magenta: 0xff00ff,
+            bright_cyan: 0x00ffff,
+            bright_white: 0xffffff,
+        }
+    }
+
+    /// Matrix theme - green on black
+    pub fn matrix() -> Self {
+        Self {
+            name: "matrix".into(),
+            foreground: 0x00ff00,
+            background: 0x000000,
+            cursor: 0x00ff00,
+            black: 0x000000,
+            red: 0x003300,
+            green: 0x00ff00,
+            yellow: 0x00cc00,
+            blue: 0x003300,
+            magenta: 0x009900,
+            cyan: 0x00ff00,
+            white: 0x00ff00,
+            bright_black: 0x003300,
+            bright_red: 0x006600,
+            bright_green: 0x00ff00,
+            bright_yellow: 0x00ff00,
+            bright_blue: 0x006600,
+            bright_magenta: 0x00cc00,
+            bright_cyan: 0x00ff00,
+            bright_white: 0x00ff00,
+        }
+    }
+
+    /// List all built-in scheme names
+    pub fn builtin_names() -> &'static [&'static str] {
+        &["default", "light", "matrix"]
     }
 }
 

@@ -9,7 +9,9 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::terminal::{keystroke_to_escape, terminal::color_to_rgb, Terminal, TerminalSize};
+use crate::app::AppState;
+use crate::config::ColorScheme;
+use crate::terminal::{keystroke_to_escape, terminal::{color_to_rgb_with_scheme, hex_to_rgb}, Terminal, TerminalSize};
 
 /// Cursor blink interval in milliseconds
 const CURSOR_BLINK_INTERVAL_MS: u64 = 500;
@@ -486,10 +488,16 @@ struct TerminalPaintData {
     selected_cells: Vec<(usize, usize)>,
     text_runs: Vec<PositionedTextRun>,
     cursor: Option<(usize, usize, CursorShape)>,
+    background_color: Hsla,
+    cursor_color: Hsla,
 }
 
-fn color_to_hsla(color: Color, colors: &alacritty_terminal::term::color::Colors) -> Hsla {
-    let rgb = color_to_rgb(color, colors);
+fn color_to_hsla(color: Color, colors: &alacritty_terminal::term::color::Colors, scheme: &ColorScheme) -> Hsla {
+    let rgb = color_to_rgb_with_scheme(color, colors, scheme);
+    rgb_to_hsla(rgb)
+}
+
+fn rgb_to_hsla(rgb: alacritty_terminal::vte::ansi::Rgb) -> Hsla {
     let r = rgb.r as f32 / 255.0;
     let g = rgb.g as f32 / 255.0;
     let b = rgb.b as f32 / 255.0;
@@ -525,6 +533,12 @@ impl Render for TerminalView {
         let terminal = self.terminal.clone();
         let focused = self.focus_handle.is_focused(window);
 
+        // Get color scheme from AppState
+        let scheme = cx
+            .try_global::<AppState>()
+            .map(|state| state.app.lock().config.appearance.color_scheme())
+            .unwrap_or_else(ColorScheme::default_dark);
+
         // Reset cursor blink when focus changes
         if focused != self.was_focused {
             if focused {
@@ -555,9 +569,12 @@ impl Render for TerminalView {
         // Clone bounds_origin for the canvas callback
         let bounds_origin_for_canvas = self.bounds_origin.clone();
 
+        // Compute background color from scheme
+        let bg_color = rgb_to_hsla(hex_to_rgb(scheme.background));
+
         div()
             .size_full()
-            .bg(rgb(0x1e1e2e))
+            .bg(bg_color)
             .track_focus(&self.focus_handle)
             .on_mouse_down(MouseButton::Left, cx.listener(Self::handle_mouse_down))
             .on_mouse_move(cx.listener(Self::handle_mouse_move))
@@ -569,6 +586,7 @@ impl Render for TerminalView {
                     {
                         let terminal = terminal.clone();
                         let bounds_origin = bounds_origin_for_canvas.clone();
+                        let scheme = scheme.clone();
                         move |bounds, window, _cx| {
                             // Update bounds origin for mouse coordinate conversion
                             *bounds_origin.lock() = bounds.origin;
@@ -643,12 +661,12 @@ impl Render for TerminalView {
                                         if cell_bg != Color::Named(NamedColor::Background) || is_inverse {
                                             let bg_color = if is_inverse && cell_bg == Color::Named(NamedColor::Foreground) {
                                                 // Default foreground as background in inverse mode
-                                                color_to_hsla(Color::Named(NamedColor::Foreground), &colors)
+                                                color_to_hsla(Color::Named(NamedColor::Foreground), &colors, &scheme)
                                             } else if is_inverse && cell.fg == Color::Named(NamedColor::Foreground) {
                                                 // Use default foreground color for inverse
-                                                color_to_hsla(Color::Named(NamedColor::Foreground), &colors)
+                                                color_to_hsla(Color::Named(NamedColor::Foreground), &colors, &scheme)
                                             } else {
-                                                color_to_hsla(cell_bg, &colors)
+                                                color_to_hsla(cell_bg, &colors, &scheme)
                                             };
                                             bg_rects.push((col_idx, line_idx, bg_color));
                                         }
@@ -662,7 +680,7 @@ impl Render for TerminalView {
                                             continue;
                                         }
 
-                                        let fg_color = color_to_hsla(cell_fg, &colors);
+                                        let fg_color = color_to_hsla(cell_fg, &colors, &scheme);
                                         let bold = cell.flags.contains(Flags::BOLD);
 
                                         let can_extend = current_run.as_ref().map_or(false, |run| {
@@ -714,6 +732,10 @@ impl Render for TerminalView {
                                 None
                             };
 
+                            // Compute cursor color from scheme
+                            let cursor_color = rgb_to_hsla(hex_to_rgb(scheme.cursor));
+                            let background_color = rgb_to_hsla(hex_to_rgb(scheme.background));
+
                             TerminalPaintData {
                                 cell_width,
                                 cell_height,
@@ -723,6 +745,8 @@ impl Render for TerminalView {
                                 selected_cells,
                                 text_runs,
                                 cursor,
+                                background_color,
+                                cursor_color,
                             }
                         }
                     },
@@ -794,7 +818,7 @@ impl Render for TerminalView {
                                 let x = origin.x + data.cell_width * col as f32;
                                 let y = origin.y + data.cell_height * line as f32;
 
-                                let cursor_color = hsla(0.0, 0.0, 0.9, 0.9);
+                                let cursor_color = data.cursor_color;
 
                                 match shape {
                                     CursorShape::Block => {

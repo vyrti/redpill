@@ -552,6 +552,17 @@ impl Drop for Terminal {
     }
 }
 
+use crate::config::ColorScheme;
+
+/// Convert a hex color (0xRRGGBB) to Rgb
+pub fn hex_to_rgb(hex: u32) -> Rgb {
+    Rgb {
+        r: ((hex >> 16) & 0xff) as u8,
+        g: ((hex >> 8) & 0xff) as u8,
+        b: (hex & 0xff) as u8,
+    }
+}
+
 /// Convert an alacritty color to RGB
 pub fn color_to_rgb(color: Color, colors: &Colors) -> Rgb {
     match color {
@@ -565,6 +576,75 @@ pub fn color_to_rgb(color: Color, colors: &Colors) -> Rgb {
                 index_to_rgb(idx)
             }
         }
+    }
+}
+
+/// Convert an alacritty color to RGB using a color scheme
+pub fn color_to_rgb_with_scheme(color: Color, colors: &Colors, scheme: &ColorScheme) -> Rgb {
+    match color {
+        Color::Named(named) => named_color_to_rgb_with_scheme(named, colors, scheme),
+        Color::Spec(rgb) => rgb,
+        Color::Indexed(idx) => {
+            // Use scheme colors for standard 16 colors
+            if idx < 16 {
+                index_to_rgb_with_scheme(idx, scheme)
+            } else if let Some(rgb) = colors[idx as usize] {
+                rgb
+            } else {
+                index_to_rgb(idx)
+            }
+        }
+    }
+}
+
+/// Convert a named color to RGB using a color scheme
+fn named_color_to_rgb_with_scheme(named: NamedColor, colors: &Colors, scheme: &ColorScheme) -> Rgb {
+    match colors[named] {
+        Some(rgb) => rgb,
+        None => match named {
+            NamedColor::Black => hex_to_rgb(scheme.black),
+            NamedColor::Red => hex_to_rgb(scheme.red),
+            NamedColor::Green => hex_to_rgb(scheme.green),
+            NamedColor::Yellow => hex_to_rgb(scheme.yellow),
+            NamedColor::Blue => hex_to_rgb(scheme.blue),
+            NamedColor::Magenta => hex_to_rgb(scheme.magenta),
+            NamedColor::Cyan => hex_to_rgb(scheme.cyan),
+            NamedColor::White => hex_to_rgb(scheme.white),
+            NamedColor::BrightBlack => hex_to_rgb(scheme.bright_black),
+            NamedColor::BrightRed => hex_to_rgb(scheme.bright_red),
+            NamedColor::BrightGreen => hex_to_rgb(scheme.bright_green),
+            NamedColor::BrightYellow => hex_to_rgb(scheme.bright_yellow),
+            NamedColor::BrightBlue => hex_to_rgb(scheme.bright_blue),
+            NamedColor::BrightMagenta => hex_to_rgb(scheme.bright_magenta),
+            NamedColor::BrightCyan => hex_to_rgb(scheme.bright_cyan),
+            NamedColor::BrightWhite => hex_to_rgb(scheme.bright_white),
+            NamedColor::Foreground => hex_to_rgb(scheme.foreground),
+            NamedColor::Background => hex_to_rgb(scheme.background),
+            _ => hex_to_rgb(scheme.foreground),
+        },
+    }
+}
+
+/// Convert a 256-color index to RGB using scheme for first 16 colors
+fn index_to_rgb_with_scheme(idx: u8, scheme: &ColorScheme) -> Rgb {
+    match idx {
+        0 => hex_to_rgb(scheme.black),
+        1 => hex_to_rgb(scheme.red),
+        2 => hex_to_rgb(scheme.green),
+        3 => hex_to_rgb(scheme.yellow),
+        4 => hex_to_rgb(scheme.blue),
+        5 => hex_to_rgb(scheme.magenta),
+        6 => hex_to_rgb(scheme.cyan),
+        7 => hex_to_rgb(scheme.white),
+        8 => hex_to_rgb(scheme.bright_black),
+        9 => hex_to_rgb(scheme.bright_red),
+        10 => hex_to_rgb(scheme.bright_green),
+        11 => hex_to_rgb(scheme.bright_yellow),
+        12 => hex_to_rgb(scheme.bright_blue),
+        13 => hex_to_rgb(scheme.bright_magenta),
+        14 => hex_to_rgb(scheme.bright_cyan),
+        15 => hex_to_rgb(scheme.bright_white),
+        _ => index_to_rgb(idx),
     }
 }
 
