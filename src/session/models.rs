@@ -57,6 +57,9 @@ pub struct SshSession {
     pub group_id: Option<Uuid>,
     /// Optional color tag for visual identification
     pub color_tag: Option<String>,
+    /// Optional color scheme override for this session
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color_scheme: Option<String>,
 }
 
 fn default_port() -> u16 {
@@ -75,6 +78,7 @@ impl SshSession {
             auth: AuthMethod::default(),
             group_id: None,
             color_tag: None,
+            color_scheme: None,
         }
     }
 

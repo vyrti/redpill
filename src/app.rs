@@ -23,17 +23,20 @@ pub struct TerminalTab {
     pub title: String,
     /// Whether the tab has unsaved state
     pub dirty: bool,
+    /// Color scheme override for this tab
+    pub color_scheme: Option<String>,
 }
 
 impl TerminalTab {
     /// Create a new terminal tab
-    pub fn new(terminal: Terminal, session_id: Option<Uuid>, title: String) -> Self {
+    pub fn new(terminal: Terminal, session_id: Option<Uuid>, title: String, color_scheme: Option<String>) -> Self {
         Self {
             id: Uuid::new_v4(),
             session_id,
             terminal: Arc::new(Mutex::new(terminal)),
             title,
             dirty: false,
+            color_scheme,
         }
     }
 }
@@ -56,6 +59,7 @@ impl RedPillApp {
     /// Create a new application instance
     pub fn new() -> Self {
         let config = AppConfig::load().unwrap_or_default();
+        let session_tree_visible = config.session_tree.visible;
         let session_manager = SessionManager::new().unwrap_or_else(|e| {
             tracing::error!("Failed to load sessions: {}", e);
             SessionManager::default()
@@ -66,7 +70,7 @@ impl RedPillApp {
             session_manager,
             tabs: Vec::new(),
             active_tab: None,
-            session_tree_visible: true,
+            session_tree_visible,
         }
     }
 
@@ -76,7 +80,7 @@ impl RedPillApp {
         let terminal =
             Terminal::new_local(config).map_err(|e| format!("Failed to create terminal: {}", e))?;
 
-        let tab = TerminalTab::new(terminal, None, "Local".to_string());
+        let tab = TerminalTab::new(terminal, None, "Local".to_string(), None);
         let id = tab.id;
 
         self.tabs.push(tab);
@@ -96,8 +100,8 @@ impl RedPillApp {
         let title = session.name().to_string();
 
         // Get SSH session config
-        let ssh_session = match session {
-            Session::Ssh(ssh) => ssh.clone(),
+        let (ssh_session, color_scheme) = match session {
+            Session::Ssh(ssh) => (ssh.clone(), ssh.color_scheme.clone()),
             Session::Local(_) => {
                 // For local sessions, just open a local terminal
                 return self.open_local_terminal();
@@ -204,6 +208,7 @@ impl RedPillApp {
             terminal: terminal_arc,
             title,
             dirty: false,
+            color_scheme,
         };
         let id = tab.id;
 
@@ -270,6 +275,8 @@ impl RedPillApp {
     /// Toggle session tree visibility
     pub fn toggle_session_tree(&mut self) {
         self.session_tree_visible = !self.session_tree_visible;
+        self.config.session_tree.visible = self.session_tree_visible;
+        let _ = self.config.save();
     }
 
     /// Count the number of active SSH connections (tabs with session_id)

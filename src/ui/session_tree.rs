@@ -802,11 +802,9 @@ impl Render for SessionTree {
             .relative()
             .flex()
             .flex_col()
-            .w(px(250.0))
+            .min_w(px(150.0))
             .h_full()
             .bg(rgb(0x1e1e2e))
-            .border_r_1()
-            .border_color(rgb(0x313244))
             .child(
                 // Header
                 div()
@@ -819,10 +817,35 @@ impl Render for SessionTree {
                     .border_color(rgb(0x313244))
                     .child(
                         div()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(0xcdd6f4))
-                            .child("Sessions"),
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            // Collapse button
+                            .child(
+                                div()
+                                    .id("collapse-tree-btn")
+                                    .px_1()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .text_xs()
+                                    .text_color(rgb(0x6c7086))
+                                    .hover(|style| style.bg(rgb(0x313244)).text_color(rgb(0xcdd6f4)))
+                                    .on_click(cx.listener(|_this, _event, _window, cx| {
+                                        if let Some(app_state) = cx.try_global::<AppState>() {
+                                            let mut app = app_state.app.lock();
+                                            app.toggle_session_tree();
+                                        }
+                                        cx.notify();
+                                    }))
+                                    .child("\u{25C0}"),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(0xcdd6f4))
+                                    .child("Sessions"),
+                            ),
                     )
                     .child(
                         div()

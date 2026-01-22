@@ -50,6 +50,8 @@ pub struct SessionDialog {
     auth_type: AuthType,
     save_password: bool,
     save_passphrase: bool,
+    /// Color scheme override (None = use default)
+    color_scheme: Option<String>,
     /// Validation errors
     errors: Vec<String>,
 }
@@ -78,6 +80,7 @@ impl SessionDialog {
             auth_type: AuthType::Password,
             save_password: false,
             save_passphrase: false,
+            color_scheme: None,
             errors: Vec::new(),
         }
     }
@@ -147,6 +150,7 @@ impl SessionDialog {
             auth_type,
             save_password,
             save_passphrase,
+            color_scheme: session.color_scheme.clone(),
             errors: Vec::new(),
         }
     }
@@ -161,7 +165,7 @@ impl SessionDialog {
         let window_options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                 None,
-                size(px(450.0), px(580.0)),
+                size(px(450.0), px(640.0)),
                 cx,
             ))),
             titlebar: Some(TitlebarOptions {
@@ -183,7 +187,7 @@ impl SessionDialog {
         let window_options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                 None,
-                size(px(450.0), px(580.0)),
+                size(px(450.0), px(640.0)),
                 cx,
             ))),
             titlebar: Some(TitlebarOptions {
@@ -270,6 +274,7 @@ impl SessionDialog {
         session.port = port;
         session.auth = auth;
         session.group_id = self.group_id;
+        session.color_scheme = self.color_scheme.clone();
 
         // Preserve ID if editing
         if let Some(id) = self.session_id {
@@ -357,6 +362,55 @@ impl SessionDialog {
                 cx.notify();
             }))
             .child(div().text_sm().child(label))
+    }
+
+    fn render_color_scheme_option(
+        &self,
+        label: impl Into<SharedString>,
+        scheme_value: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let label = label.into();
+        let is_selected = self.color_scheme == scheme_value;
+        let scheme_for_click = scheme_value.clone();
+
+        div()
+            .id(ElementId::Name(format!("scheme-{}", scheme_value.as_deref().unwrap_or("default")).into()))
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .cursor_pointer()
+            .when(is_selected, |this| {
+                this.bg(rgb(0x89b4fa)).text_color(rgb(0x1e1e2e))
+            })
+            .when(!is_selected, |this| {
+                this.bg(rgb(0x313244))
+                    .text_color(rgb(0xcdd6f4))
+                    .hover(|style| style.bg(rgb(0x45475a)))
+            })
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                this.color_scheme = scheme_for_click.clone();
+                cx.notify();
+            }))
+            .child(div().text_sm().child(label))
+    }
+
+    fn render_color_scheme_selector(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(self.render_label("Color Scheme"))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(self.render_color_scheme_option("Default", None, cx))
+                    .child(self.render_color_scheme_option("Light", Some("light".to_string()), cx))
+                    .child(self.render_color_scheme_option("Matrix", Some("matrix".to_string()), cx))
+                    .child(self.render_color_scheme_option("Red", Some("red".to_string()), cx)),
+            )
     }
 
     fn render_errors(&self) -> impl IntoElement {
@@ -513,6 +567,9 @@ impl Render for SessionDialog {
                 } else if auth_type == AuthType::PrivateKey {
                     form = form.child(self.render_key_fields());
                 }
+
+                // Color scheme selector
+                form = form.child(self.render_color_scheme_selector(cx));
 
                 form
             })

@@ -144,6 +144,7 @@ impl ColorScheme {
             "default" => Some(Self::default_dark()),
             "light" => Some(Self::light()),
             "matrix" => Some(Self::matrix()),
+            "red" => Some(Self::red()),
             _ => None,
         }
     }
@@ -226,9 +227,35 @@ impl ColorScheme {
         }
     }
 
+    /// Red theme - red on black
+    pub fn red() -> Self {
+        Self {
+            name: "red".into(),
+            foreground: 0xff0000,
+            background: 0x000000,
+            cursor: 0xff0000,
+            black: 0x000000,
+            red: 0xff0000,
+            green: 0x330000,
+            yellow: 0xcc0000,
+            blue: 0x330000,
+            magenta: 0x990000,
+            cyan: 0xff0000,
+            white: 0xff0000,
+            bright_black: 0x330000,
+            bright_red: 0xff0000,
+            bright_green: 0x660000,
+            bright_yellow: 0xff0000,
+            bright_blue: 0x660000,
+            bright_magenta: 0xcc0000,
+            bright_cyan: 0xff0000,
+            bright_white: 0xff0000,
+        }
+    }
+
     /// List all built-in scheme names
     pub fn builtin_names() -> &'static [&'static str] {
-        &["default", "light", "matrix"]
+        &["default", "light", "matrix", "red"]
     }
 }
 

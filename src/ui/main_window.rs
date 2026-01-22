@@ -9,6 +9,11 @@ use super::session_tree::SessionTree;
 use super::terminal_tabs::{TabInfo, TerminalTabs};
 use super::terminal_view::TerminalView;
 
+/// Minimum session tree width in pixels
+const MIN_TREE_WIDTH: f32 = 150.0;
+/// Maximum session tree width in pixels
+const MAX_TREE_WIDTH: f32 = 500.0;
+
 /// Main window component
 pub struct MainWindow {
     /// Session tree view
@@ -21,6 +26,10 @@ pub struct MainWindow {
     active_tab_id: Option<Uuid>,
     /// Previously active tab ID (to detect changes)
     prev_active_tab_id: Option<Uuid>,
+    /// Session tree width in pixels
+    session_tree_width: f32,
+    /// Whether currently resizing the session tree
+    is_resizing: bool,
 }
 
 impl MainWindow {
@@ -33,12 +42,20 @@ impl MainWindow {
         // Create tabs view with empty tabs
         let tabs_view = cx.new(|_| TerminalTabs::new(Vec::new(), None));
 
+        // Get initial session tree width from config
+        let session_tree_width = cx
+            .try_global::<AppState>()
+            .map(|state| state.app.lock().config.session_tree.width as f32)
+            .unwrap_or(250.0);
+
         Self {
             session_tree,
             tabs_view,
             terminal_views: Vec::new(),
             active_tab_id: None,
             prev_active_tab_id: None,
+            session_tree_width,
+            is_resizing: false,
         }
     }
 
@@ -54,12 +71,12 @@ impl MainWindow {
             let tab_infos: Vec<TabInfo> = app.tabs.iter().map(TabInfo::from).collect();
             let active_tab = app.active_tab().map(|t| t.id);
 
-            // Collect info for new tabs that need views created
+            // Collect info for new tabs that need views created (including color_scheme)
             let new_tabs: Vec<_> = app
                 .tabs
                 .iter()
                 .filter(|tab| !self.terminal_views.iter().any(|(id, _)| *id == tab.id))
-                .map(|tab| (tab.id, tab.terminal.clone()))
+                .map(|tab| (tab.id, tab.terminal.clone(), tab.color_scheme.clone()))
                 .collect();
 
             let tab_ids: Vec<Uuid> = app.tabs.iter().map(|t| t.id).collect();
@@ -77,8 +94,8 @@ impl MainWindow {
         self.active_tab_id = active_tab;
 
         // Create terminal views for new tabs
-        for (tab_id, terminal) in new_tabs {
-            let view = cx.new(|cx| TerminalView::new(terminal, cx));
+        for (tab_id, terminal, color_scheme) in new_tabs {
+            let view = cx.new(|cx| TerminalView::new(terminal, color_scheme, cx));
             self.terminal_views.push((tab_id, view));
         }
 
@@ -91,6 +108,20 @@ impl MainWindow {
         self.active_tab_id.and_then(|id| {
             self.terminal_views.iter().find(|(tid, _)| *tid == id).map(|(_, v)| v)
         })
+    }
+
+    /// Handle resize end - save width to config
+    fn finish_resize(&mut self, cx: &mut Context<Self>) {
+        if self.is_resizing {
+            self.is_resizing = false;
+            // Save width to config
+            if let Some(app_state) = cx.try_global::<AppState>() {
+                let mut app = app_state.app.lock();
+                app.config.session_tree.width = self.session_tree_width as u32;
+                let _ = app.config.save();
+            }
+            cx.notify();
+        }
     }
 }
 
@@ -115,20 +146,95 @@ impl Render for MainWindow {
             true
         };
 
+        let tree_width = self.session_tree_width;
+        let is_resizing = self.is_resizing;
+
+        // Root container with window-level mouse handlers for drag tracking
         div()
+            .id("main-window-root")
             .flex()
             .flex_col()
             .size_full()
             .bg(rgb(0x1e1e2e))
+            // Window-level mouse move handler for resize dragging
+            .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
+                if this.is_resizing {
+                    let x: f32 = event.position.x.into();
+                    let new_width = x.clamp(MIN_TREE_WIDTH, MAX_TREE_WIDTH);
+                    this.session_tree_width = new_width;
+                    cx.notify();
+                }
+            }))
+            // Window-level mouse up handler to end resize
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _event, _window, cx| {
+                this.finish_resize(cx);
+            }))
+            // Also handle mouse up outside window (when dragged out)
+            .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _event, _window, cx| {
+                this.finish_resize(cx);
+            }))
             .child(
                 // Main content area
                 div()
                     .flex()
                     .flex_1()
                     .overflow_hidden()
-                    // Session tree (left panel)
+                    // Expand button (when tree is collapsed)
+                    .when(!session_tree_visible, |this| {
+                        this.child(
+                            div()
+                                .id("expand-tree-btn")
+                                .w(px(24.0))
+                                .h_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .bg(rgb(0x1e1e2e))
+                                .border_r_1()
+                                .border_color(rgb(0x313244))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(0x313244)))
+                                .on_click(cx.listener(|_this, _event, _window, cx| {
+                                    if let Some(app_state) = cx.try_global::<AppState>() {
+                                        let mut app = app_state.app.lock();
+                                        app.toggle_session_tree();
+                                    }
+                                    cx.notify();
+                                }))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0x6c7086))
+                                        .child("\u{25B6}"),
+                                ),
+                        )
+                    })
+                    // Session tree (left panel) with dynamic width
                     .when(session_tree_visible, |this| {
-                        this.child(self.session_tree.clone())
+                        this.child(
+                            div()
+                                .w(px(tree_width))
+                                .h_full()
+                                .border_r_1()
+                                .border_color(rgb(0x313244))
+                                .child(self.session_tree.clone()),
+                        )
+                    })
+                    // Resize handle - only handles mouse down to start resize
+                    .when(session_tree_visible, |this| {
+                        this.child(
+                            div()
+                                .id("resize-handle")
+                                .w(px(6.0))
+                                .h_full()
+                                .cursor_col_resize()
+                                .when(is_resizing, |s| s.bg(rgb(0x89b4fa)))
+                                .when(!is_resizing, |s| s.hover(|h| h.bg(rgb(0x45475a))))
+                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _event, _window, cx| {
+                                    this.is_resizing = true;
+                                    cx.notify();
+                                })),
+                        )
                     })
                     // Terminal area (right side)
                     .child(

@@ -37,10 +37,12 @@ pub struct TerminalView {
     last_blink_toggle: Instant,
     /// Whether terminal was focused in previous frame
     was_focused: bool,
+    /// Color scheme override for this terminal (None = use global)
+    color_scheme_override: Option<String>,
 }
 
 impl TerminalView {
-    pub fn new(terminal: Arc<Mutex<Terminal>>, cx: &mut Context<Self>) -> Self {
+    pub fn new(terminal: Arc<Mutex<Terminal>>, color_scheme_override: Option<String>, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
 
         let terminal_weak = Arc::downgrade(&terminal);
@@ -97,6 +99,7 @@ impl TerminalView {
             cursor_visible: true,
             last_blink_toggle: Instant::now(),
             was_focused: false,
+            color_scheme_override,
         }
     }
 
@@ -533,11 +536,16 @@ impl Render for TerminalView {
         let terminal = self.terminal.clone();
         let focused = self.focus_handle.is_focused(window);
 
-        // Get color scheme from AppState
-        let scheme = cx
-            .try_global::<AppState>()
-            .map(|state| state.app.lock().config.appearance.color_scheme())
-            .unwrap_or_else(ColorScheme::default_dark);
+        // Get color scheme - check override first, then global
+        let scheme = self
+            .color_scheme_override
+            .as_ref()
+            .and_then(|name| ColorScheme::builtin(name))
+            .unwrap_or_else(|| {
+                cx.try_global::<AppState>()
+                    .map(|state| state.app.lock().config.appearance.color_scheme())
+                    .unwrap_or_else(ColorScheme::default_dark)
+            });
 
         // Reset cursor blink when focus changes
         if focused != self.was_focused {
@@ -899,6 +907,6 @@ impl Render for TerminalView {
     }
 }
 
-pub fn terminal_view(terminal: Arc<Mutex<Terminal>>, _window: &mut Window, cx: &mut App) -> Entity<TerminalView> {
-    cx.new(|cx| TerminalView::new(terminal, cx))
+pub fn terminal_view(terminal: Arc<Mutex<Terminal>>, color_scheme: Option<String>, _window: &mut Window, cx: &mut App) -> Entity<TerminalView> {
+    cx.new(|cx| TerminalView::new(terminal, color_scheme, cx))
 }
