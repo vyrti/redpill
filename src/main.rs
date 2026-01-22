@@ -8,7 +8,7 @@ use gpui::*;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::app::AppState;
-use crate::ui::{open_main_window, SessionDialog};
+use crate::ui::{open_main_window, QuitConfirmDialog, SessionDialog};
 
 fn main() {
     // Initialize logging
@@ -70,7 +70,20 @@ fn main() {
 
         // Register global actions
         cx.on_action(|_: &Quit, cx| {
-            cx.quit();
+            // Check for active SSH connections before quitting
+            let ssh_count = if let Some(state) = cx.try_global::<AppState>() {
+                state.app.lock().active_ssh_connection_count()
+            } else {
+                0
+            };
+
+            if ssh_count > 0 {
+                // Show confirmation dialog
+                QuitConfirmDialog::open(ssh_count, cx);
+            } else {
+                // No active connections, quit immediately
+                cx.quit();
+            }
         });
 
         cx.on_action(|_: &About, _cx| {

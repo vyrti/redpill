@@ -4,6 +4,7 @@ use uuid::Uuid;
 
 use crate::app::AppState;
 
+use super::quit_confirm_dialog::QuitConfirmDialog;
 use super::session_tree::SessionTree;
 use super::terminal_tabs::{TabInfo, TerminalTabs};
 use super::terminal_view::TerminalView;
@@ -215,6 +216,24 @@ pub fn open_main_window(cx: &mut App) -> WindowHandle<MainWindow> {
         // Initialize app state
         let app_state = AppState::new();
         cx.set_global(app_state);
+
+        // Register window close handler to check for active SSH connections
+        window.on_window_should_close(cx, |_window, cx| {
+            // Check for active SSH connections
+            let ssh_count = if let Some(state) = cx.try_global::<AppState>() {
+                state.app.lock().active_ssh_connection_count()
+            } else {
+                0
+            };
+
+            if ssh_count > 0 {
+                // Show confirmation dialog and prevent close
+                QuitConfirmDialog::open(ssh_count, cx);
+                false // Don't close the window yet
+            } else {
+                true // Allow the window to close
+            }
+        });
 
         // Activate window to bring to foreground
         window.activate_window();

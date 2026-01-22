@@ -272,6 +272,12 @@ impl RedPillApp {
         self.session_tree_visible = !self.session_tree_visible;
     }
 
+    /// Count the number of active SSH connections (tabs with session_id)
+    #[must_use]
+    pub fn active_ssh_connection_count(&self) -> usize {
+        self.tabs.iter().filter(|tab| tab.session_id.is_some()).count()
+    }
+
     /// Mass connect to all sessions in a group
     pub fn mass_connect(&mut self, group_id: Uuid, runtime: &TokioRuntime) -> Vec<Result<Uuid, String>> {
         let session_ids = self
