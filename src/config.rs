@@ -340,6 +340,10 @@ pub struct AppConfig {
     /// Whether to restore sessions on startup
     #[serde(default)]
     pub restore_sessions: bool,
+
+    /// Whether to show scrollbar indicator
+    #[serde(default = "default_true")]
+    pub show_scrollbar: bool,
 }
 
 impl Default for AppConfig {
@@ -352,6 +356,7 @@ impl Default for AppConfig {
             scrollback_lines: 10000,
             confirm_close: true,
             restore_sessions: false,
+            show_scrollbar: true,
         }
     }
 }

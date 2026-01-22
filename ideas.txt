@@ -1,0 +1,2 @@
+subfolders
+aws ec2 using session manager connection

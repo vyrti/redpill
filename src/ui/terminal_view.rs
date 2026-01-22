@@ -405,13 +405,14 @@ impl TerminalView {
         }
 
         // Normal scroll behavior (scrollback)
+        // On macOS with natural scrolling: swipe up = positive delta = scroll into history
         let lines = match event.delta {
-            ScrollDelta::Lines(lines) => -lines.y as i32,
+            ScrollDelta::Lines(lines) => lines.y as i32,
             ScrollDelta::Pixels(pixels) => {
                 let cell_h: f32 = self.cell_height.into();
                 if cell_h > 0.0 {
                     let px_y: f32 = pixels.y.into();
-                    -(px_y / cell_h).round() as i32
+                    (px_y / cell_h).round() as i32
                 } else {
                     0
                 }
@@ -493,6 +494,8 @@ struct TerminalPaintData {
     cursor: Option<(usize, usize, CursorShape)>,
     background_color: Hsla,
     cursor_color: Hsla,
+    /// Scrollbar data: (display_offset, history_size, show_scrollbar)
+    scrollbar: Option<(usize, usize)>,
 }
 
 fn color_to_hsla(color: Color, colors: &alacritty_terminal::term::color::Colors, scheme: &ColorScheme) -> Hsla {
@@ -537,15 +540,25 @@ impl Render for TerminalView {
         let focused = self.focus_handle.is_focused(window);
 
         // Get color scheme - check override first, then global
-        let scheme = self
-            .color_scheme_override
-            .as_ref()
-            .and_then(|name| ColorScheme::builtin(name))
-            .unwrap_or_else(|| {
-                cx.try_global::<AppState>()
-                    .map(|state| state.app.lock().config.appearance.color_scheme())
-                    .unwrap_or_else(ColorScheme::default_dark)
+        let (scheme, show_scrollbar) = {
+            let global_config = cx.try_global::<AppState>().map(|state| {
+                let app = state.app.lock();
+                (app.config.appearance.color_scheme(), app.config.show_scrollbar)
             });
+
+            let scheme = self
+                .color_scheme_override
+                .as_ref()
+                .and_then(|name| ColorScheme::builtin(name))
+                .unwrap_or_else(|| {
+                    global_config.as_ref()
+                        .map(|(s, _)| s.clone())
+                        .unwrap_or_else(ColorScheme::default_dark)
+                });
+
+            let show_scrollbar = global_config.map(|(_, sb)| sb).unwrap_or(true);
+            (scheme, show_scrollbar)
+        };
 
         // Reset cursor blink when focus changes
         if focused != self.was_focused {
@@ -628,100 +641,117 @@ impl Render for TerminalView {
                             let mut bg_rects = Vec::new();
                             let mut selected_cells = Vec::new();
                             let mut text_runs = Vec::new();
+                            let mut render_display_offset: usize = 0;
+                            let mut render_history_size: usize = 0;
 
                             terminal.with_term(|term| {
-                                let content = term.grid();
+                                // Use renderable_content() to properly handle scrollback
+                                let content = term.renderable_content();
+                                let display_offset = content.display_offset as i32;
+                                render_display_offset = content.display_offset;
+                                render_history_size = term.history_size();
                                 let screen_lines = term.screen_lines();
-                                let columns = term.columns();
 
-                                // Get selection range for checking points
-                                let selection_range = term.selection.as_ref().and_then(|s| s.to_range(term));
+                                let mut current_run: Option<PositionedTextRun> = None;
+                                let mut last_line: Option<i32> = None;
 
-                                for line_idx in 0..screen_lines {
-                                    let line = Line(line_idx as i32);
-                                    let mut current_run: Option<PositionedTextRun> = None;
+                                for indexed in content.display_iter {
+                                    let pt = indexed.point;
+                                    let cell = indexed.cell;
 
-                                    for col_idx in 0..columns {
-                                        let col = Column(col_idx);
-                                        let pt = TermPoint::new(line, col);
-                                        let cell = &content[pt];
+                                    // Convert grid line to screen row (0-indexed from top)
+                                    let screen_row = (pt.line.0 + display_offset) as usize;
+                                    let col_idx = pt.column.0;
 
-                                        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                                            continue;
+                                    // Skip cells outside visible area
+                                    if screen_row >= screen_lines {
+                                        continue;
+                                    }
+
+                                    // Flush current run when moving to new line
+                                    if last_line != Some(pt.line.0) {
+                                        if let Some(run) = current_run.take() {
+                                            text_runs.push(run);
                                         }
+                                        last_line = Some(pt.line.0);
+                                    }
 
-                                        // Check selection using alacritty's built-in
-                                        if let Some(ref range) = selection_range {
-                                            if range.contains(pt) {
-                                                selected_cells.push((col_idx, line_idx));
-                                            }
+                                    if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                                        continue;
+                                    }
+
+                                    // Check selection using alacritty's built-in
+                                    if let Some(ref range) = content.selection {
+                                        if range.contains(pt) {
+                                            selected_cells.push((col_idx, screen_row));
                                         }
+                                    }
 
-                                        // Handle INVERSE flag (reverse video) - swap fg and bg
-                                        let is_inverse = cell.flags.contains(Flags::INVERSE);
-                                        let (cell_fg, cell_bg) = if is_inverse {
-                                            (cell.bg, cell.fg)
+                                    // Handle INVERSE flag (reverse video) - swap fg and bg
+                                    let is_inverse = cell.flags.contains(Flags::INVERSE);
+                                    let (cell_fg, cell_bg) = if is_inverse {
+                                        (cell.bg, cell.fg)
+                                    } else {
+                                        (cell.fg, cell.bg)
+                                    };
+
+                                    // Background color
+                                    if cell_bg != Color::Named(NamedColor::Background) || is_inverse {
+                                        let bg_color = if is_inverse && cell_bg == Color::Named(NamedColor::Foreground) {
+                                            // Default foreground as background in inverse mode
+                                            color_to_hsla(Color::Named(NamedColor::Foreground), &colors, &scheme)
+                                        } else if is_inverse && cell.fg == Color::Named(NamedColor::Foreground) {
+                                            // Use default foreground color for inverse
+                                            color_to_hsla(Color::Named(NamedColor::Foreground), &colors, &scheme)
                                         } else {
-                                            (cell.fg, cell.bg)
+                                            color_to_hsla(cell_bg, &colors, &scheme)
                                         };
+                                        bg_rects.push((col_idx, screen_row, bg_color));
+                                    }
 
-                                        // Background color
-                                        if cell_bg != Color::Named(NamedColor::Background) || is_inverse {
-                                            let bg_color = if is_inverse && cell_bg == Color::Named(NamedColor::Foreground) {
-                                                // Default foreground as background in inverse mode
-                                                color_to_hsla(Color::Named(NamedColor::Foreground), &colors, &scheme)
-                                            } else if is_inverse && cell.fg == Color::Named(NamedColor::Foreground) {
-                                                // Use default foreground color for inverse
-                                                color_to_hsla(Color::Named(NamedColor::Foreground), &colors, &scheme)
-                                            } else {
-                                                color_to_hsla(cell_bg, &colors, &scheme)
-                                            };
-                                            bg_rects.push((col_idx, line_idx, bg_color));
+                                    let c = cell.c;
+                                    if c == ' ' || c == '\0' {
+                                        if let Some(run) = current_run.take() {
+                                            text_runs.push(run);
                                         }
+                                        // Still need to draw background for spaces in inverse mode
+                                        continue;
+                                    }
 
-                                        let c = cell.c;
-                                        if c == ' ' || c == '\0' {
-                                            if let Some(run) = current_run.take() {
-                                                text_runs.push(run);
-                                            }
-                                            // Still need to draw background for spaces in inverse mode
-                                            continue;
+                                    let fg_color = color_to_hsla(cell_fg, &colors, &scheme);
+                                    let bold = cell.flags.contains(Flags::BOLD);
+
+                                    let can_extend = current_run.as_ref().map_or(false, |run| {
+                                        run.line == screen_row
+                                            && run.col + run.text.chars().count() == col_idx
+                                            && run.fg_color == fg_color
+                                            && run.bold == bold
+                                    });
+
+                                    if can_extend {
+                                        current_run.as_mut().unwrap().text.push(c);
+                                    } else {
+                                        if let Some(run) = current_run.take() {
+                                            text_runs.push(run);
                                         }
-
-                                        let fg_color = color_to_hsla(cell_fg, &colors, &scheme);
-                                        let bold = cell.flags.contains(Flags::BOLD);
-
-                                        let can_extend = current_run.as_ref().map_or(false, |run| {
-                                            run.line == line_idx
-                                                && run.col + run.text.chars().count() == col_idx
-                                                && run.fg_color == fg_color
-                                                && run.bold == bold
+                                        current_run = Some(PositionedTextRun {
+                                            col: col_idx,
+                                            line: screen_row,
+                                            text: c.to_string(),
+                                            fg_color,
+                                            bold,
                                         });
-
-                                        if can_extend {
-                                            current_run.as_mut().unwrap().text.push(c);
-                                        } else {
-                                            if let Some(run) = current_run.take() {
-                                                text_runs.push(run);
-                                            }
-                                            current_run = Some(PositionedTextRun {
-                                                col: col_idx,
-                                                line: line_idx,
-                                                text: c.to_string(),
-                                                fg_color,
-                                                bold,
-                                            });
-                                        }
                                     }
+                                }
 
-                                    if let Some(run) = current_run.take() {
-                                        text_runs.push(run);
-                                    }
+                                if let Some(run) = current_run.take() {
+                                    text_runs.push(run);
                                 }
                             });
 
                             // Determine cursor position and shape
-                            let cursor = if cursor_should_show {
+                            // Hide cursor when scrolled into history (display_offset > 0)
+                            let cursor = if cursor_should_show && render_display_offset == 0 {
                                 let col = cursor_pos.column.0;
                                 let line = cursor_pos.line.0;
 
@@ -744,6 +774,13 @@ impl Render for TerminalView {
                             let cursor_color = rgb_to_hsla(hex_to_rgb(scheme.cursor));
                             let background_color = rgb_to_hsla(hex_to_rgb(scheme.background));
 
+                            // Scrollbar data: only show if enabled and there's history to scroll
+                            let scrollbar = if show_scrollbar && render_history_size > 0 {
+                                Some((render_display_offset, render_history_size))
+                            } else {
+                                None
+                            };
+
                             TerminalPaintData {
                                 cell_width,
                                 cell_height,
@@ -755,6 +792,7 @@ impl Render for TerminalView {
                                 cursor,
                                 background_color,
                                 cursor_color,
+                                scrollbar,
                             }
                         }
                     },
@@ -877,6 +915,50 @@ impl Render for TerminalView {
                                         ));
                                     }
                                 }
+                            }
+
+                            // Draw scrollbar if enabled and there's scrollback content
+                            if let Some((display_offset, history_size)) = data.scrollbar {
+                                let scrollbar_width = px(6.0);
+                                let scrollbar_margin = px(2.0);
+                                let terminal_height = data.cell_height * data.rows as f32;
+
+                                // Total scrollable content = history + screen
+                                let total_lines = history_size + data.rows;
+                                let visible_ratio = data.rows as f32 / total_lines as f32;
+
+                                // Thumb size (minimum 20px for usability)
+                                let thumb_height = (terminal_height * visible_ratio).max(px(20.0));
+
+                                // Thumb position: when display_offset=history_size, thumb at top
+                                // when display_offset=0, thumb at bottom
+                                let scroll_range = terminal_height - thumb_height;
+                                let scroll_ratio = if history_size > 0 {
+                                    display_offset as f32 / history_size as f32
+                                } else {
+                                    0.0
+                                };
+                                // Invert: high display_offset = scrolled up = thumb at top
+                                let thumb_y = origin.y + scroll_range * (1.0 - scroll_ratio);
+
+                                // Scrollbar track (subtle background)
+                                let track_x = origin.x + data.cell_width * data.cols as f32 - scrollbar_width - scrollbar_margin;
+                                window.paint_quad(fill(
+                                    Bounds::new(
+                                        point(track_x, origin.y),
+                                        size(scrollbar_width, terminal_height),
+                                    ),
+                                    hsla(0.0, 0.0, 0.5, 0.1),
+                                ));
+
+                                // Scrollbar thumb
+                                window.paint_quad(fill(
+                                    Bounds::new(
+                                        point(track_x, thumb_y),
+                                        size(scrollbar_width, thumb_height),
+                                    ),
+                                    hsla(0.0, 0.0, 0.6, 0.4),
+                                ));
                             }
 
                             // Check if resize is needed

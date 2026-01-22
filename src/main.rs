@@ -59,6 +59,7 @@ fn main() {
                     name: "View".into(),
                     items: vec![
                         MenuItem::action("Toggle Session Tree", ToggleSessionTree),
+                        MenuItem::action("Show Scrollbar", ToggleScrollbar),
                         MenuItem::separator(),
                         MenuItem::action("Zoom In", ZoomIn),
                         MenuItem::action("Zoom Out", ZoomOut),
@@ -125,6 +126,16 @@ fn main() {
         cx.on_action(|_: &ToggleSessionTree, cx| {
             if let Some(state) = cx.try_global::<AppState>() {
                 state.app.lock().toggle_session_tree();
+            }
+            cx.refresh_windows();
+        });
+
+        // ToggleScrollbar - toggle scrollbar visibility
+        cx.on_action(|_: &ToggleScrollbar, cx| {
+            if let Some(state) = cx.try_global::<AppState>() {
+                let mut app = state.app.lock();
+                app.config.show_scrollbar = !app.config.show_scrollbar;
+                let _ = app.config.save();
             }
             cx.refresh_windows();
         });
@@ -218,6 +229,7 @@ actions!(
         Paste,
         SelectAll,
         ToggleSessionTree,
+        ToggleScrollbar,
         ZoomIn,
         ZoomOut,
         ZoomReset,

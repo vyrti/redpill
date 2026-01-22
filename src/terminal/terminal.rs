@@ -141,8 +141,11 @@ impl Terminal {
         let id = Uuid::new_v4();
         let (event_tx, event_rx) = event_channel();
 
-        // Create terminal config
-        let term_config = TermConfig::default();
+        // Create terminal config with scrollback history
+        let term_config = TermConfig {
+            scrolling_history: config.scrollback_lines,
+            ..TermConfig::default()
+        };
 
         // Create terminal size (implements Dimensions)
         let term_size = SizeInfo::new(config.size.cols, config.size.rows);
@@ -199,8 +202,11 @@ impl Terminal {
         let id = Uuid::new_v4();
         let (event_tx, event_rx) = event_channel();
 
-        // Create terminal config
-        let term_config = TermConfig::default();
+        // Create terminal config with scrollback history
+        let term_config = TermConfig {
+            scrolling_history: config.scrollback_lines,
+            ..TermConfig::default()
+        };
 
         // Create terminal size
         let term_size = SizeInfo::new(config.size.cols, config.size.rows);
