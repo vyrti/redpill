@@ -27,6 +27,12 @@ russh = "0.46"
 russh-keys = "0.46"
 ssh-key = { version = "0.6", features = ["std"] }
 
+# AWS SSM Session Manager
+aws-config = { version = "1.1", features = ["behavior-version-latest"] }
+aws-sdk-ssm = "1.101"
+tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
+sha2 = "0.10"
+
 # Async Runtime
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"

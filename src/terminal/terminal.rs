@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 use super::events::{event_channel, TerminalEvent, TerminalEventSender};
 use super::ssh_backend::SshBackend;
+use super::ssm_backend::SsmBackend;
 
 /// Terminal size in characters and pixels
 #[derive(Debug, Clone, Copy, Default)]
@@ -104,10 +105,20 @@ pub enum TerminalMode2 {
     Local {
         notifier: Notifier,
     },
-    /// Remote mode - display-only, data fed via write_to_pty
+    /// Remote mode - display-only, data fed via write_to_pty (SSH)
     Remote {
         notifier: Notifier,
         backend: Arc<TokioMutex<SshBackend>>,
+        /// Sender for write data (doesn't require backend lock)
+        write_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+        /// Sender for resize requests (doesn't require backend lock)
+        resize_tx: tokio::sync::mpsc::UnboundedSender<TerminalSize>,
+        tokio_handle: TokioHandle,
+    },
+    /// SSM mode - AWS Systems Manager Session Manager connection
+    Ssm {
+        notifier: Notifier,
+        backend: Arc<TokioMutex<SsmBackend>>,
         /// Sender for write data (doesn't require backend lock)
         write_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
         /// Sender for resize requests (doesn't require backend lock)
@@ -269,17 +280,93 @@ impl Terminal {
         })
     }
 
+    /// Create an SSM terminal (display-only mode for AWS SSM Session Manager)
+    pub fn new_ssm(config: TerminalConfig, backend: SsmBackend, tokio_handle: TokioHandle) -> io::Result<Self> {
+        let id = Uuid::new_v4();
+        let (event_tx, event_rx) = event_channel();
+
+        // Create terminal config with scrollback history
+        let term_config = TermConfig {
+            scrolling_history: config.scrollback_lines,
+            ..TermConfig::default()
+        };
+
+        // Create terminal size
+        let term_size = SizeInfo::new(config.size.cols, config.size.rows);
+
+        // Create window size (for PTY)
+        let window_size = WindowSize {
+            num_cols: config.size.cols,
+            num_lines: config.size.rows,
+            cell_width: 1,
+            cell_height: 1,
+        };
+
+        // Create the terminal
+        let term = Term::new(term_config, &term_size, event_tx.clone());
+        let term = Arc::new(FairMutex::new(term));
+
+        // Create PTY options (we still need a PTY for the EventLoop, but it won't be used for SSM data)
+        // Use 'cat' as a null placeholder - it blocks waiting for stdin and consumes no resources.
+        // SSM data is fed directly via the VT processor, bypassing this dummy PTY entirely.
+        let pty_config = PtyOptions {
+            shell: Some(tty::Shell::new("/bin/cat".to_string(), vec![])),
+            working_directory: None,
+            hold: false,
+            env: HashMap::new(),
+        };
+
+        // Create a dummy PTY - we'll feed SSM data via write_to_pty
+        let pty = tty::new(&pty_config, window_size, id.as_u128() as u64)?;
+
+        // Create event loop
+        let event_loop = EventLoop::new(term.clone(), event_tx, pty, false, false)?;
+
+        // Get notifier before starting the loop
+        let notifier = Notifier(event_loop.channel());
+
+        // Spawn the event loop
+        let _join_handle = event_loop.spawn();
+
+        // Set up write and resize channels - the actual channel setup happens in setup_channels
+        // after connection, so we just create placeholder senders here
+        let (write_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (resize_tx, _) = tokio::sync::mpsc::unbounded_channel();
+
+        let backend_arc = Arc::new(TokioMutex::new(backend));
+
+        Ok(Self {
+            id,
+            term,
+            mode: TerminalMode2::Ssm {
+                notifier,
+                backend: backend_arc,
+                write_tx,
+                resize_tx,
+                tokio_handle,
+            },
+            event_rx,
+            config,
+            title: "SSM".to_string(),
+            dirty: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
     /// Update the write sender after I/O setup
     pub fn set_write_tx(&mut self, tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>) {
-        if let TerminalMode2::Remote { write_tx, .. } = &mut self.mode {
-            *write_tx = tx;
+        match &mut self.mode {
+            TerminalMode2::Remote { write_tx, .. } => *write_tx = tx,
+            TerminalMode2::Ssm { write_tx, .. } => *write_tx = tx,
+            _ => {}
         }
     }
 
     /// Update the resize sender after I/O setup
     pub fn set_resize_tx(&mut self, tx: tokio::sync::mpsc::UnboundedSender<TerminalSize>) {
-        if let TerminalMode2::Remote { resize_tx, .. } = &mut self.mode {
-            *resize_tx = tx;
+        match &mut self.mode {
+            TerminalMode2::Remote { resize_tx, .. } => *resize_tx = tx,
+            TerminalMode2::Ssm { resize_tx, .. } => *resize_tx = tx,
+            _ => {}
         }
     }
 
@@ -287,7 +374,15 @@ impl Terminal {
     pub fn ssh_backend(&self) -> Option<Arc<TokioMutex<SshBackend>>> {
         match &self.mode {
             TerminalMode2::Remote { backend, .. } => Some(backend.clone()),
-            TerminalMode2::Local { .. } => None,
+            _ => None,
+        }
+    }
+
+    /// Get the SSM backend (for spawning I/O task)
+    pub fn ssm_backend(&self) -> Option<Arc<TokioMutex<SsmBackend>>> {
+        match &self.mode {
+            TerminalMode2::Ssm { backend, .. } => Some(backend.clone()),
+            _ => None,
         }
     }
 
@@ -301,18 +396,18 @@ impl Terminal {
         &self.title
     }
 
-    /// Write data TO the terminal for display (from SSH output)
+    /// Write data TO the terminal for display (from SSH/SSM output)
     ///
     /// This feeds data into alacritty for parsing and display.
-    /// Use this for data received FROM SSH that needs to be rendered.
+    /// Use this for data received FROM SSH/SSM that needs to be rendered.
     pub fn write_to_pty(&self, data: &[u8]) {
         match &self.mode {
             TerminalMode2::Local { notifier } => {
                 // For local terminals, send through the PTY event loop
                 notifier.notify(data.to_vec());
             }
-            TerminalMode2::Remote { .. } => {
-                // For SSH terminals, directly process data through the VT parser
+            TerminalMode2::Remote { .. } | TerminalMode2::Ssm { .. } => {
+                // For SSH/SSM terminals, directly process data through the VT parser
                 // This ensures escape sequences (like mouse mode) are handled correctly
                 let mut processor = Processor::<StdSyncHandler>::new();
                 let mut term = self.term.lock();
@@ -325,7 +420,7 @@ impl Terminal {
         }
     }
 
-    /// Write keyboard input (goes to PTY for local, SSH for remote)
+    /// Write keyboard input (goes to PTY for local, SSH/SSM for remote)
     ///
     /// This sends user keyboard input to the shell/remote process.
     pub fn write(&self, data: &[u8]) {
@@ -334,10 +429,17 @@ impl Terminal {
                 notifier.notify(data.to_vec());
             }
             TerminalMode2::Remote { write_tx, .. } => {
-                // Send through the write channel (processed by ssh_write_loop)
+                // Send through the write channel (processed by ssh_io_loop)
                 tracing::debug!("SSH write: queuing {} bytes", data.len());
                 if let Err(e) = write_tx.send(data.to_vec()) {
                     tracing::error!("SSH write send error: {}", e);
+                }
+            }
+            TerminalMode2::Ssm { write_tx, .. } => {
+                // Send through the write channel (processed by ssm_io_loop)
+                tracing::debug!("SSM write: queuing {} bytes", data.len());
+                if let Err(e) = write_tx.send(data.to_vec()) {
+                    tracing::error!("SSM write send error: {}", e);
                 }
             }
         }
@@ -403,7 +505,7 @@ impl Terminal {
             term.resize(size_info);
         }
 
-        // Notify the PTY / SSH backend
+        // Notify the PTY / SSH / SSM backend
         match &self.mode {
             TerminalMode2::Local { notifier } => {
                 let _ = notifier.0.send(Msg::Resize(window_size));
@@ -416,6 +518,16 @@ impl Terminal {
                 tracing::debug!("SSH resize: queuing {}x{}", size.cols, size.rows);
                 if let Err(e) = resize_tx.send(size) {
                     tracing::error!("SSH resize send error: {}", e);
+                }
+            }
+            TerminalMode2::Ssm { notifier, resize_tx, .. } => {
+                // Notify the event loop
+                let _ = notifier.0.send(Msg::Resize(window_size));
+
+                // Send resize through channel (handled by I/O loop)
+                tracing::debug!("SSM resize: queuing {}x{}", size.cols, size.rows);
+                if let Err(e) = resize_tx.send(size) {
+                    tracing::error!("SSM resize send error: {}", e);
                 }
             }
         }
@@ -553,6 +665,7 @@ impl Drop for Terminal {
         let notifier = match &self.mode {
             TerminalMode2::Local { notifier } => notifier,
             TerminalMode2::Remote { notifier, .. } => notifier,
+            TerminalMode2::Ssm { notifier, .. } => notifier,
         };
         let _ = notifier.0.send(Msg::Shutdown);
     }

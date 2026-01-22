@@ -219,6 +219,61 @@ impl LocalSession {
     }
 }
 
+/// An AWS SSM Session Manager session configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SsmSession {
+    /// Unique identifier
+    pub id: Uuid,
+    /// Display name for the session
+    pub name: String,
+    /// EC2 instance ID (i-xxx) or on-prem managed instance ID (mi-xxx)
+    pub instance_id: String,
+    /// AWS region (defaults to environment/config if None)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    /// AWS profile name (defaults to "default" if None)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// Optional group membership
+    pub group_id: Option<Uuid>,
+    /// Optional color scheme override for this session
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color_scheme: Option<String>,
+}
+
+impl SsmSession {
+    /// Create a new SSM session with default values
+    pub fn new(name: impl Into<String>, instance_id: impl Into<String>) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            instance_id: instance_id.into(),
+            region: None,
+            profile: None,
+            group_id: None,
+            color_scheme: None,
+        }
+    }
+
+    /// Create a new SSM session with region and profile
+    pub fn with_config(
+        name: impl Into<String>,
+        instance_id: impl Into<String>,
+        region: Option<String>,
+        profile: Option<String>,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            instance_id: instance_id.into(),
+            region,
+            profile,
+            group_id: None,
+            color_scheme: None,
+        }
+    }
+}
+
 /// A session group for organizing sessions
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionGroup {
@@ -260,6 +315,7 @@ impl SessionGroup {
 pub enum Session {
     Ssh(SshSession),
     Local(LocalSession),
+    Ssm(SsmSession),
 }
 
 impl Session {
@@ -268,6 +324,7 @@ impl Session {
         match self {
             Session::Ssh(s) => s.id,
             Session::Local(s) => s.id,
+            Session::Ssm(s) => s.id,
         }
     }
 
@@ -276,6 +333,7 @@ impl Session {
         match self {
             Session::Ssh(s) => &s.name,
             Session::Local(s) => &s.name,
+            Session::Ssm(s) => &s.name,
         }
     }
 
@@ -284,6 +342,7 @@ impl Session {
         match self {
             Session::Ssh(s) => s.group_id,
             Session::Local(s) => s.group_id,
+            Session::Ssm(s) => s.group_id,
         }
     }
 
@@ -292,6 +351,7 @@ impl Session {
         match self {
             Session::Ssh(s) => s.group_id = group_id,
             Session::Local(s) => s.group_id = group_id,
+            Session::Ssm(s) => s.group_id = group_id,
         }
     }
 }

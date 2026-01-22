@@ -8,7 +8,7 @@ use gpui::*;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::app::AppState;
-use crate::ui::{open_main_window, QuitConfirmDialog, SessionDialog};
+use crate::ui::{open_main_window, QuitConfirmDialog, SessionDialog, SsmSessionDialog};
 
 fn main() {
     // Initialize logging
@@ -42,6 +42,7 @@ fn main() {
                     items: vec![
                         MenuItem::action("New Terminal", NewTerminal),
                         MenuItem::action("New SSH Session...", NewSshSession),
+                        MenuItem::action("New SSM Session...", NewSsmSession),
                         MenuItem::separator(),
                         MenuItem::action("Close Tab", CloseTab),
                     ],
@@ -105,9 +106,14 @@ fn main() {
             cx.refresh_windows();
         });
 
-        // NewSshSession - open the session dialog
+        // NewSshSession - open the SSH session dialog
         cx.on_action(|_: &NewSshSession, cx| {
             SessionDialog::open_new(cx);
+        });
+
+        // NewSsmSession - open the SSM session dialog
+        cx.on_action(|_: &NewSsmSession, cx| {
+            SsmSessionDialog::open_new(cx);
         });
 
         // CloseTab - close the active tab
@@ -224,6 +230,7 @@ actions!(
         ShowSettings,
         NewTerminal,
         NewSshSession,
+        NewSsmSession,
         CloseTab,
         Copy,
         Paste,

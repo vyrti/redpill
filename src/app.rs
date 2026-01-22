@@ -8,8 +8,10 @@ use uuid::Uuid;
 use gpui::*;
 
 use crate::config::AppConfig;
-use crate::session::{LocalSession, Session, SessionGroup, SessionManager, SshSession};
-use crate::terminal::{SshBackend, Terminal, TerminalConfig, TerminalSize};
+use crate::session::{LocalSession, Session, SessionGroup, SessionManager, SshSession, SsmSession};
+use crate::terminal::{SshBackend, SsmBackend, SsmMessageBuilder, Terminal, TerminalConfig, TerminalSize, connect_websocket, handle_ssm_message};
+use futures::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 /// Represents an open terminal tab
 pub struct TerminalTab {
@@ -105,6 +107,10 @@ impl RedPillApp {
             Session::Local(_) => {
                 // For local sessions, just open a local terminal
                 return self.open_local_terminal();
+            }
+            Session::Ssm(_) => {
+                // For SSM sessions, use the SSM method
+                return self.open_ssm_session(session_id, runtime);
             }
         };
 
@@ -217,6 +223,133 @@ impl RedPillApp {
 
         tracing::info!(
             "Opened SSH session tab: {} for session: {}",
+            id,
+            session_id
+        );
+        Ok(id)
+    }
+
+    /// Open a terminal for an SSM session (sync wrapper that spawns async task)
+    pub fn open_ssm_session(&mut self, session_id: Uuid, runtime: &TokioRuntime) -> Result<Uuid, String> {
+        let session = self
+            .session_manager
+            .get_session(session_id)
+            .ok_or_else(|| "Session not found".to_string())?;
+
+        let title = session.name().to_string();
+
+        // Get SSM session config
+        let (ssm_session, color_scheme) = match session {
+            Session::Ssm(ssm) => (ssm.clone(), ssm.color_scheme.clone()),
+            Session::Ssh(_) => {
+                // For SSH sessions, use the SSH method
+                return self.open_ssh_session(session_id, runtime);
+            }
+            Session::Local(_) => {
+                // For local sessions, just open a local terminal
+                return self.open_local_terminal();
+            }
+        };
+
+        // Create SSM backend (not connected yet)
+        let backend = SsmBackend::new(ssm_session);
+
+        // Create terminal in SSM mode with tokio handle for async operations
+        let config = TerminalConfig::default();
+        let terminal = Terminal::new_ssm(config, backend, runtime.handle().clone())
+            .map_err(|e| format!("Failed to create SSM terminal: {}", e))?;
+
+        // Get the backend for the I/O task
+        let backend_arc = terminal
+            .ssm_backend()
+            .expect("SSM terminal should have backend");
+
+        let terminal_arc = Arc::new(Mutex::new(terminal));
+
+        // Spawn the async connection and I/O task on Tokio runtime
+        let terminal_weak = Arc::downgrade(&terminal_arc);
+        let backend_for_connect = backend_arc.clone();
+
+        runtime.spawn(async move {
+            // Connect to SSM (get WebSocket URL and token)
+            let (write_rx, resize_rx) = {
+                let mut backend = backend_for_connect.lock().await;
+                match backend.connect().await {
+                    Ok(()) => {
+                        tracing::info!("SSM session started");
+                        backend.setup_channels()
+                    }
+                    Err(e) => {
+                        tracing::error!("SSM connection failed: {}", e);
+                        // Display error message in terminal
+                        if let Some(term_arc) = terminal_weak.upgrade() {
+                            let term = term_arc.lock();
+                            let error_msg = format!(
+                                "\x1b[2J\x1b[H\r\n\
+                                \x1b[1;31m  SSM Connection Failed\x1b[0m\r\n\
+                                \r\n\
+                                \x1b[33m  {}\x1b[0m\r\n",
+                                e
+                            );
+                            term.write_to_pty(error_msg.as_bytes());
+                        }
+                        return;
+                    }
+                }
+            };
+
+            // Connect to WebSocket
+            let ws_stream = {
+                let mut backend = backend_for_connect.lock().await;
+                match connect_websocket(&mut backend).await {
+                    Ok(ws) => ws,
+                    Err(e) => {
+                        tracing::error!("SSM WebSocket connection failed: {}", e);
+                        if let Some(term_arc) = terminal_weak.upgrade() {
+                            let term = term_arc.lock();
+                            let error_msg = format!(
+                                "\r\n\x1b[1;31m  WebSocket Connection Failed\x1b[0m\r\n\
+                                \r\n\x1b[33m  {}\x1b[0m\r\n",
+                                e
+                            );
+                            term.write_to_pty(error_msg.as_bytes());
+                        }
+                        return;
+                    }
+                }
+            };
+
+            // Update terminal's write_tx and resize_tx
+            let write_tx = backend_for_connect.lock().await.get_write_sender();
+            let resize_tx = backend_for_connect.lock().await.get_resize_sender();
+
+            if let (Some(term_arc), Some(wtx), Some(rtx)) =
+                (terminal_weak.upgrade(), write_tx, resize_tx)
+            {
+                let mut term = term_arc.lock();
+                term.set_write_tx(wtx);
+                term.set_resize_tx(rtx);
+            }
+
+            // Start the I/O loop
+            spawn_ssm_io_loop(terminal_weak, backend_for_connect, ws_stream, write_rx, resize_rx).await;
+        });
+
+        let tab = TerminalTab {
+            id: Uuid::new_v4(),
+            session_id: Some(session_id),
+            terminal: terminal_arc,
+            title,
+            dirty: false,
+            color_scheme,
+        };
+        let id = tab.id;
+
+        self.tabs.push(tab);
+        self.active_tab = Some(self.tabs.len() - 1);
+
+        tracing::info!(
+            "Opened SSM session tab: {} for session: {}",
             id,
             session_id
         );
@@ -350,6 +483,11 @@ impl RedPillApp {
         self.session_manager.add_local_session(session)
     }
 
+    /// Add a new SSM session
+    pub fn add_ssm_session(&mut self, session: SsmSession) -> Uuid {
+        self.session_manager.add_ssm_session(session)
+    }
+
     /// Delete a session
     pub fn delete_session(&mut self, id: Uuid) -> Result<(), String> {
         // Close any tabs using this session
@@ -474,6 +612,136 @@ async fn spawn_ssh_io_loop(
     let _ = channel.close().await;
 
     // Update backend state
+    let mut b = backend.lock().await;
+    let _ = b.close().await;
+}
+
+/// Combined SSM I/O loop using tokio::select! for concurrent read/write/resize
+///
+/// This handles the AWS SSM Session Manager WebSocket protocol, including:
+/// - Sending input data with proper SSM message framing
+/// - Receiving output data and parsing SSM message headers
+/// - Sending acknowledgements for received messages
+/// - Handling resize events
+async fn spawn_ssm_io_loop(
+    terminal: std::sync::Weak<Mutex<Terminal>>,
+    backend: Arc<TokioMutex<SsmBackend>>,
+    ws_stream: crate::terminal::SsmWebSocket,
+    mut write_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    mut resize_rx: tokio::sync::mpsc::UnboundedReceiver<TerminalSize>,
+) {
+    let (mut ws_sink, mut ws_stream) = ws_stream.split();
+    let mut msg_builder = SsmMessageBuilder::new();
+
+    loop {
+        tokio::select! {
+            // Handle user input (keyboard -> SSM)
+            Some(data) = write_rx.recv() => {
+                tracing::debug!("SSM write: sending {} bytes", data.len());
+                let msg = msg_builder.build_input(&data);
+                if let Err(e) = ws_sink.send(WsMessage::Binary(msg.into())).await {
+                    tracing::error!("SSM write error: {}", e);
+                    break;
+                }
+            }
+
+            // Handle resize requests (window resize -> SSM)
+            Some(size) = resize_rx.recv() => {
+                tracing::debug!("SSM resize: sending {}x{}", size.cols, size.rows);
+                let msg = msg_builder.build_resize(size.cols, size.rows);
+                if let Err(e) = ws_sink.send(WsMessage::Binary(msg.into())).await {
+                    tracing::error!("SSM resize error: {}", e);
+                    // Don't break on resize error
+                }
+            }
+
+            // Handle SSM WebSocket messages (SSM -> terminal)
+            msg = ws_stream.next() => {
+                match msg {
+                    Some(Ok(WsMessage::Binary(data))) => {
+                        match handle_ssm_message(&data) {
+                            Ok((Some(output), ack_info)) => {
+                                // Write output to terminal
+                                if let Some(term_arc) = terminal.upgrade() {
+                                    let term = term_arc.lock();
+                                    term.write_to_pty(&output);
+                                } else {
+                                    tracing::info!("Terminal dropped, stopping SSM I/O");
+                                    break;
+                                }
+
+                                // Send ACK if required
+                                if let Some((msg_id, seq)) = ack_info {
+                                    let ack = msg_builder.build_ack(msg_id, seq);
+                                    if let Err(e) = ws_sink.send(WsMessage::Binary(ack.into())).await {
+                                        tracing::warn!("SSM ACK send error: {}", e);
+                                    }
+                                }
+                            }
+                            Ok((None, Some((msg_id, seq)))) => {
+                                // Non-output message that needs ACK
+                                let ack = msg_builder.build_ack(msg_id, seq);
+                                if let Err(e) = ws_sink.send(WsMessage::Binary(ack.into())).await {
+                                    tracing::warn!("SSM ACK send error: {}", e);
+                                }
+                            }
+                            Ok((None, None)) => {
+                                // No action needed
+                            }
+                            Err(e) => {
+                                tracing::warn!("SSM message parse error: {}", e);
+                                // Check if this is a session closed error
+                                if matches!(e, crate::terminal::SsmError::SessionClosed(_)) {
+                                    if let Some(term_arc) = terminal.upgrade() {
+                                        let term = term_arc.lock();
+                                        term.write_to_pty(b"\r\n\x1b[1;33m  Session closed by server\x1b[0m\r\n");
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Some(Ok(WsMessage::Text(text))) => {
+                        // Text messages are usually control/status messages
+                        tracing::debug!("SSM text message: {}", text);
+                    }
+                    Some(Ok(WsMessage::Close(_))) => {
+                        tracing::info!("SSM WebSocket closed");
+                        if let Some(term_arc) = terminal.upgrade() {
+                            let term = term_arc.lock();
+                            term.write_to_pty(b"\r\n\x1b[1;33m  Connection closed\x1b[0m\r\n");
+                        }
+                        break;
+                    }
+                    Some(Ok(WsMessage::Ping(data))) => {
+                        // Respond to ping with pong
+                        if let Err(e) = ws_sink.send(WsMessage::Pong(data)).await {
+                            tracing::warn!("SSM pong send error: {}", e);
+                        }
+                    }
+                    Some(Ok(WsMessage::Pong(_))) | Some(Ok(WsMessage::Frame(_))) => {
+                        // Ignore pong and frame messages
+                    }
+                    Some(Err(e)) => {
+                        tracing::error!("SSM WebSocket error: {}", e);
+                        if let Some(term_arc) = terminal.upgrade() {
+                            let term = term_arc.lock();
+                            let error_msg = format!("\r\n\x1b[1;31m  WebSocket error: {}\x1b[0m\r\n", e);
+                            term.write_to_pty(error_msg.as_bytes());
+                        }
+                        break;
+                    }
+                    None => {
+                        tracing::info!("SSM WebSocket stream ended");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Clean up
+    let _ = ws_sink.close().await;
     let mut b = backend.lock().await;
     let _ = b.close().await;
 }

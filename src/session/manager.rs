@@ -1,7 +1,7 @@
 use thiserror::Error;
 use uuid::Uuid;
 
-use super::models::{Session, SessionData, SessionGroup, SshSession, LocalSession};
+use super::models::{Session, SessionData, SessionGroup, SshSession, LocalSession, SsmSession};
 use super::storage::{SessionStorage, StorageError};
 
 /// Errors that can occur during session management
@@ -103,6 +103,15 @@ impl SessionManager {
         id
     }
 
+    /// Add a new SSM session
+    pub fn add_ssm_session(&mut self, session: SsmSession) -> Uuid {
+        let id = session.id;
+        self.data.sessions.push(Session::Ssm(session));
+        self.dirty = true;
+        tracing::info!("Added SSM session: {}", id);
+        id
+    }
+
     /// Get a session by ID
     pub fn get_session(&self, id: Uuid) -> Option<&Session> {
         self.data.find_session(id)
@@ -133,6 +142,19 @@ impl SessionManager {
         match existing {
             Some(s) => {
                 *s = Session::Local(session);
+                self.dirty = true;
+                Ok(())
+            }
+            None => Err(ManagerError::SessionNotFound(id)),
+        }
+    }
+
+    /// Update an SSM session
+    pub fn update_ssm_session(&mut self, id: Uuid, session: SsmSession) -> Result<(), ManagerError> {
+        let existing = self.data.sessions.iter_mut().find(|s| s.id() == id);
+        match existing {
+            Some(s) => {
+                *s = Session::Ssm(session);
                 self.dirty = true;
                 Ok(())
             }

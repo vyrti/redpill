@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use uuid::Uuid;
 
 use crate::app::AppState;
-use crate::session::{Session, SessionGroup, SshSession};
+use crate::session::{Session, SessionGroup, SshSession, SsmSession};
 use super::session_dialog::SessionDialog;
 use super::group_dialog::GroupDialog;
 use super::delete_confirm_dialog::DeleteConfirmDialog;
@@ -145,7 +145,18 @@ impl SessionTree {
     fn handle_open_session(&mut self, session_id: Uuid, cx: &mut Context<Self>) {
         if let Some(app_state) = cx.try_global::<AppState>() {
             let runtime = app_state.tokio_runtime.clone();
-            let _ = app_state.app.lock().open_ssh_session(session_id, &runtime);
+            let mut app = app_state.app.lock();
+            // Check session type and call appropriate method
+            if let Some(session) = app.session_manager.get_session(session_id) {
+                let result = match session {
+                    Session::Ssh(_) => app.open_ssh_session(session_id, &runtime),
+                    Session::Ssm(_) => app.open_ssm_session(session_id, &runtime),
+                    Session::Local(_) => app.open_local_terminal(),
+                };
+                if let Err(e) = result {
+                    tracing::error!("Failed to open session: {}", e);
+                }
+            }
         }
         cx.emit(SessionTreeEvent::OpenSession(session_id));
         cx.notify();
@@ -369,6 +380,7 @@ impl SessionTree {
         let icon = match session {
             Session::Ssh(_) => "🖥️",
             Session::Local(_) => "💻",
+            Session::Ssm(_) => "☁️",
         };
         let group_id = format!("session-row-{}", session_id);
 
@@ -722,15 +734,22 @@ impl Render for SessionTree {
         // Handle pending edit session request
         if let Some(session_id) = self.pending_edit_session.take() {
             tracing::info!("Edit session requested for: {}", session_id);
-            let mut session_to_edit: Option<SshSession> = None;
+            let mut ssh_session_to_edit: Option<SshSession> = None;
+            let mut ssm_session_to_edit: Option<SsmSession> = None;
             if let Some(app_state) = cx.try_global::<AppState>() {
                 let app = app_state.app.lock();
                 if let Some(session) = app.session_manager.get_session(session_id) {
                     tracing::info!("Found session: {:?}", session.name());
-                    if let Session::Ssh(ssh_session) = session {
-                        session_to_edit = Some(ssh_session.clone());
-                    } else {
-                        tracing::info!("Session is not SSH, skipping edit");
+                    match session {
+                        Session::Ssh(ssh_session) => {
+                            ssh_session_to_edit = Some(ssh_session.clone());
+                        }
+                        Session::Ssm(ssm_session) => {
+                            ssm_session_to_edit = Some(ssm_session.clone());
+                        }
+                        Session::Local(_) => {
+                            tracing::info!("Local sessions don't have edit dialogs yet");
+                        }
                     }
                 } else {
                     tracing::warn!("Session not found: {}", session_id);
@@ -738,10 +757,15 @@ impl Render for SessionTree {
             } else {
                 tracing::warn!("AppState not available");
             }
-            if let Some(session) = session_to_edit {
-                tracing::info!("Opening edit dialog for session");
+            if let Some(session) = ssh_session_to_edit {
+                tracing::info!("Opening edit dialog for SSH session");
                 cx.defer(move |cx| {
                     SessionDialog::open_edit(session, cx);
+                });
+            } else if let Some(session) = ssm_session_to_edit {
+                tracing::info!("Opening edit dialog for SSM session");
+                cx.defer(move |cx| {
+                    SessionDialog::open_edit_ssm(session, cx);
                 });
             }
         }
