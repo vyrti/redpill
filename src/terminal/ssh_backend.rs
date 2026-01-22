@@ -263,9 +263,9 @@ fn host_matches(pattern: &str, hostname: &str) -> bool {
 }
 
 /// Get the SSH key type string for a public key
-fn key_type_string(key: &PublicKey) -> String {
+fn key_type_string(key: &PublicKey) -> &str {
     // Use the key's name method which returns the algorithm identifier
-    key.name().to_string()
+    key.name()
 }
 
 /// Encode a public key to base64 (SSH wire format)

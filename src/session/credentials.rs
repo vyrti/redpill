@@ -89,6 +89,7 @@ impl CredentialManager {
     }
 
     /// Check if a credential exists in the keychain
+    #[must_use]
     pub fn exists(session_id: Uuid, cred_type: CredentialType) -> bool {
         Self::retrieve(session_id, cred_type).is_ok()
     }

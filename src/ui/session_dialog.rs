@@ -179,8 +179,7 @@ impl SessionDialog {
     }
 
     /// Open as a modal window for editing
-    pub fn open_edit(session: &SshSession, cx: &mut App) {
-        let session = session.clone();
+    pub fn open_edit(session: SshSession, cx: &mut App) {
         let window_options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                 None,
@@ -205,30 +204,31 @@ impl SessionDialog {
     fn validate(&mut self, cx: &mut Context<Self>) -> bool {
         self.errors.clear();
 
-        let name = self.name_field.read(cx).content().trim().to_string();
-        let host = self.host_field.read(cx).content().trim().to_string();
-        let port = self.port_field.read(cx).content().trim().to_string();
-        let username = self.username_field.read(cx).content().trim().to_string();
-        let key_path = self.key_path_field.read(cx).content().trim().to_string();
+        // Validate on &str to avoid unnecessary allocations
+        let name = self.name_field.read(cx).content();
+        let host = self.host_field.read(cx).content();
+        let port = self.port_field.read(cx).content();
+        let username = self.username_field.read(cx).content();
+        let key_path = self.key_path_field.read(cx).content();
 
-        if name.is_empty() {
-            self.errors.push("Name is required".to_string());
+        if name.trim().is_empty() {
+            self.errors.push("Name is required".into());
         }
 
-        if host.is_empty() {
-            self.errors.push("Host is required".to_string());
+        if host.trim().is_empty() {
+            self.errors.push("Host is required".into());
         }
 
-        if port.parse::<u16>().is_err() {
-            self.errors.push("Port must be a valid number (1-65535)".to_string());
+        if port.trim().parse::<u16>().is_err() {
+            self.errors.push("Port must be a valid number (1-65535)".into());
         }
 
-        if username.is_empty() {
-            self.errors.push("Username is required".to_string());
+        if username.trim().is_empty() {
+            self.errors.push("Username is required".into());
         }
 
-        if self.auth_type == AuthType::PrivateKey && key_path.is_empty() {
-            self.errors.push("Private key path is required".to_string());
+        if self.auth_type == AuthType::PrivateKey && key_path.trim().is_empty() {
+            self.errors.push("Private key path is required".into());
         }
 
         self.errors.is_empty()
@@ -236,29 +236,30 @@ impl SessionDialog {
 
     /// Build the session from form fields
     fn build_session(&self, cx: &Context<Self>) -> SshSession {
-        let name = self.name_field.read(cx).content().to_string();
-        let host = self.host_field.read(cx).content().to_string();
+        // Read fields only once, trim and convert to owned strings only when needed
+        let name = self.name_field.read(cx).content().trim();
+        let host = self.host_field.read(cx).content().trim();
         let port = self.port_field.read(cx).content().parse().unwrap_or(22);
-        let username = self.username_field.read(cx).content().to_string();
-        let password = self.password_field.read(cx).content().to_string();
-        let key_path = self.key_path_field.read(cx).content().to_string();
-        let key_passphrase = self.key_passphrase_field.read(cx).content().to_string();
+        let username = self.username_field.read(cx).content().trim();
+        let password = self.password_field.read(cx).content();
+        let key_path = self.key_path_field.read(cx).content();
+        let key_passphrase = self.key_passphrase_field.read(cx).content();
 
         let auth = match self.auth_type {
             AuthType::Password => AuthMethod::Password {
                 password: if password.is_empty() {
                     None
                 } else {
-                    Some(password)
+                    Some(password.to_string())
                 },
                 use_keychain: self.save_password,
             },
             AuthType::PrivateKey => AuthMethod::PrivateKey {
-                path: PathBuf::from(&key_path),
+                path: PathBuf::from(key_path.trim()),
                 passphrase: if key_passphrase.is_empty() {
                     None
                 } else {
-                    Some(key_passphrase)
+                    Some(key_passphrase.to_string())
                 },
                 use_keychain: self.save_passphrase,
             },

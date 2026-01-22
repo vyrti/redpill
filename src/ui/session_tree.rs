@@ -741,7 +741,7 @@ impl Render for SessionTree {
             if let Some(session) = session_to_edit {
                 tracing::info!("Opening edit dialog for session");
                 cx.defer(move |cx| {
-                    SessionDialog::open_edit(&session, cx);
+                    SessionDialog::open_edit(session, cx);
                 });
             }
         }

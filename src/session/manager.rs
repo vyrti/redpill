@@ -78,6 +78,7 @@ impl SessionManager {
     }
 
     /// Check if there are unsaved changes
+    #[must_use]
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }

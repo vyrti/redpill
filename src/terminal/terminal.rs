@@ -355,6 +355,7 @@ impl Terminal {
 
     /// Check if new content has been written (for SSH mode)
     /// Returns true if dirty and clears the flag
+    #[must_use]
     pub fn take_dirty(&self) -> bool {
         self.dirty.swap(false, Ordering::AcqRel)
     }
@@ -455,6 +456,7 @@ impl Terminal {
     }
 
     /// Check if cursor is visible
+    #[must_use]
     pub fn cursor_visible(&self) -> bool {
         let term = self.term.lock();
         term.mode().contains(TermMode::SHOW_CURSOR)
@@ -532,6 +534,7 @@ impl Terminal {
     }
 
     /// Check if there is an active selection
+    #[must_use]
     pub fn has_selection(&self) -> bool {
         let term = self.term.lock();
         term.selection.is_some()

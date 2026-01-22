@@ -65,13 +65,13 @@ fn default_port() -> u16 {
 
 impl SshSession {
     /// Create a new SSH session with default values
-    pub fn new(name: String, host: String, username: String) -> Self {
+    pub fn new(name: impl Into<String>, host: impl Into<String>, username: impl Into<String>) -> Self {
         Self {
             id: Uuid::new_v4(),
-            name,
-            host,
+            name: name.into(),
+            host: host.into(),
             port: 22,
-            username,
+            username: username.into(),
             auth: AuthMethod::default(),
             group_id: None,
             color_tag: None,
@@ -206,10 +206,10 @@ impl Default for LocalSession {
 
 impl LocalSession {
     /// Create a new local session with a custom name
-    pub fn new(name: String) -> Self {
+    pub fn new(name: impl Into<String>) -> Self {
         Self {
             id: Uuid::new_v4(),
-            name,
+            name: name.into(),
             ..Default::default()
         }
     }
@@ -230,20 +230,20 @@ pub struct SessionGroup {
 
 impl SessionGroup {
     /// Create a new top-level group
-    pub fn new(name: String) -> Self {
+    pub fn new(name: impl Into<String>) -> Self {
         Self {
             id: Uuid::new_v4(),
-            name,
+            name: name.into(),
             parent_id: None,
             color: None,
         }
     }
 
     /// Create a new nested group
-    pub fn new_nested(name: String, parent_id: Uuid) -> Self {
+    pub fn new_nested(name: impl Into<String>, parent_id: Uuid) -> Self {
         Self {
             id: Uuid::new_v4(),
-            name,
+            name: name.into(),
             parent_id: Some(parent_id),
             color: None,
         }

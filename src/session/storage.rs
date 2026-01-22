@@ -100,6 +100,7 @@ impl SessionStorage {
     }
 
     /// Check if the sessions file exists
+    #[must_use]
     pub fn exists(&self) -> bool {
         self.file_path.exists()
     }
