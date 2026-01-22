@@ -26,11 +26,13 @@ pub enum TabEvent {
 
 impl EventEmitter<TabEvent> for TerminalTabs {}
 
-/// State for tab context menu
-struct TabContextMenuState {
-    position: Point<Pixels>,
-    tab_id: Uuid,
-    tab_index: usize,
+/// State for tab context menu (public for rendering in MainWindow)
+#[derive(Clone)]
+pub struct TabContextMenuState {
+    pub position: Point<Pixels>,
+    pub tab_id: Uuid,
+    pub tab_index: usize,
+    pub tab_count: usize,
 }
 
 /// Tab bar component for terminal tabs
@@ -77,6 +79,43 @@ impl TerminalTabs {
         self.active_tab = tab_id;
     }
 
+    /// Get the current context menu state (for rendering in MainWindow)
+    pub fn context_menu_state(&self) -> Option<TabContextMenuState> {
+        self.context_menu.clone()
+    }
+
+    /// Close context menu (public for MainWindow to call)
+    pub fn dismiss_context_menu(&mut self, cx: &mut Context<Self>) {
+        self.context_menu = None;
+        cx.notify();
+    }
+
+    /// Close other tabs (public for MainWindow to call)
+    pub fn close_other_tabs_action(&mut self, keep_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_other_tabs(keep_id, window, cx);
+    }
+
+    /// Close tabs to right (public for MainWindow to call)
+    pub fn close_tabs_to_right_action(&mut self, from_index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_tabs_to_right(from_index, window, cx);
+    }
+
+    /// Close tabs to left (public for MainWindow to call)
+    pub fn close_tabs_to_left_action(&mut self, from_index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_tabs_to_left(from_index, window, cx);
+    }
+
+    /// Close all tabs (public for MainWindow to call)
+    pub fn close_all_tabs_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_all_tabs(window, cx);
+    }
+
+    /// Close single tab (public for MainWindow to call)
+    pub fn close_tab_action(&mut self, tab_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        self.context_menu = None;
+        self.handle_close_tab(tab_id, window, cx);
+    }
+
     fn handle_select_tab(&mut self, tab_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(app_state) = cx.try_global::<AppState>() {
             app_state.app.lock().set_active_tab_by_id(tab_id);
@@ -115,7 +154,8 @@ impl TerminalTabs {
 
     /// Show context menu for a tab
     fn show_context_menu(&mut self, position: Point<Pixels>, tab_id: Uuid, tab_index: usize, cx: &mut Context<Self>) {
-        self.context_menu = Some(TabContextMenuState { position, tab_id, tab_index });
+        let tab_count = self.tabs.len();
+        self.context_menu = Some(TabContextMenuState { position, tab_id, tab_index, tab_count });
         cx.notify();
     }
 
@@ -285,140 +325,6 @@ impl TerminalTabs {
             )
     }
 
-    fn render_context_menu(&self, menu: &TabContextMenuState, cx: &mut Context<Self>) -> impl IntoElement {
-        let tab_id = menu.tab_id;
-        let tab_index = menu.tab_index;
-        let tab_count = self.tabs.len();
-        let has_tabs_to_right = tab_index < tab_count.saturating_sub(1);
-        let has_tabs_to_left = tab_index > 0;
-        let has_other_tabs = tab_count > 1;
-
-        div()
-            .absolute()
-            .left(menu.position.x)
-            .top(menu.position.y)
-            .w(px(180.0))
-            .bg(rgb(0x313244))
-            .border_1()
-            .border_color(rgb(0x45475a))
-            .rounded_md()
-            .shadow_lg()
-            .py_1()
-            // Close Tab
-            .child(
-                div()
-                    .id("ctx-close-tab")
-                    .px_3()
-                    .py_1()
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(0x45475a)))
-                    .on_click(cx.listener(move |this, _event, window, cx| {
-                        this.context_menu = None;
-                        this.handle_close_tab(tab_id, window, cx);
-                    }))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(0xcdd6f4))
-                            .child("Close Tab"),
-                    ),
-            )
-            // Separator
-            .child(
-                div()
-                    .h(px(1.0))
-                    .mx_2()
-                    .my_1()
-                    .bg(rgb(0x45475a)),
-            )
-            // Close Other Tabs
-            .child(
-                div()
-                    .id("ctx-close-other")
-                    .px_3()
-                    .py_1()
-                    .when(has_other_tabs, |this| {
-                        this.cursor_pointer()
-                            .hover(|s| s.bg(rgb(0x45475a)))
-                            .on_click(cx.listener(move |this, _event, window, cx| {
-                                this.close_other_tabs(tab_id, window, cx);
-                            }))
-                    })
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(if has_other_tabs { rgb(0xcdd6f4) } else { rgb(0x6c7086) })
-                            .child("Close Other Tabs"),
-                    ),
-            )
-            // Close Tabs to the Right
-            .child(
-                div()
-                    .id("ctx-close-right")
-                    .px_3()
-                    .py_1()
-                    .when(has_tabs_to_right, |this| {
-                        this.cursor_pointer()
-                            .hover(|s| s.bg(rgb(0x45475a)))
-                            .on_click(cx.listener(move |this, _event, window, cx| {
-                                this.close_tabs_to_right(tab_index, window, cx);
-                            }))
-                    })
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(if has_tabs_to_right { rgb(0xcdd6f4) } else { rgb(0x6c7086) })
-                            .child("Close Tabs to the Right"),
-                    ),
-            )
-            // Close Tabs to the Left
-            .child(
-                div()
-                    .id("ctx-close-left")
-                    .px_3()
-                    .py_1()
-                    .when(has_tabs_to_left, |this| {
-                        this.cursor_pointer()
-                            .hover(|s| s.bg(rgb(0x45475a)))
-                            .on_click(cx.listener(move |this, _event, window, cx| {
-                                this.close_tabs_to_left(tab_index, window, cx);
-                            }))
-                    })
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(if has_tabs_to_left { rgb(0xcdd6f4) } else { rgb(0x6c7086) })
-                            .child("Close Tabs to the Left"),
-                    ),
-            )
-            // Separator
-            .child(
-                div()
-                    .h(px(1.0))
-                    .mx_2()
-                    .my_1()
-                    .bg(rgb(0x45475a)),
-            )
-            // Close All Tabs
-            .child(
-                div()
-                    .id("ctx-close-all")
-                    .px_3()
-                    .py_1()
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(0x45475a)))
-                    .on_click(cx.listener(move |this, _event, window, cx| {
-                        this.close_all_tabs(window, cx);
-                    }))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(0xf38ba8))
-                            .child("Close All Tabs"),
-                    ),
-            )
-    }
-
     fn render_scroll_button(&self, direction: &str, enabled: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let is_left = direction == "left";
         let arrow = if is_left { "◀" } else { "▶" };
@@ -475,8 +381,6 @@ impl Render for TerminalTabs {
         let show_scroll_buttons = tabs.len() > 5;
         let can_scroll_left = scroll_offset > 0.0;
         let can_scroll_right = scroll_offset < estimated_content_width - 400.0; // rough estimate
-
-        let has_context_menu = self.context_menu.is_some();
 
         let mut root = div()
             .relative()
@@ -540,26 +444,7 @@ impl Render for TerminalTabs {
                 ),
         );
 
-        // Context menu overlay and menu
-        if has_context_menu {
-            // Invisible overlay to capture clicks outside the menu
-            root = root.child(
-                div()
-                    .id("tab-context-menu-backdrop")
-                    .absolute()
-                    .inset_0()
-                    .on_mouse_up(MouseButton::Left, cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
-                        this.close_context_menu(cx);
-                    }))
-                    .on_mouse_up(MouseButton::Right, cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
-                        this.close_context_menu(cx);
-                    })),
-            );
-
-            if let Some(menu) = &self.context_menu {
-                root = root.child(self.render_context_menu(menu, cx));
-            }
-        }
+        // Note: Context menu is rendered in MainWindow to avoid clipping issues
 
         root
     }

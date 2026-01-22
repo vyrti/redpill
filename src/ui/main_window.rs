@@ -6,7 +6,7 @@ use crate::app::AppState;
 
 use super::quit_confirm_dialog::QuitConfirmDialog;
 use super::session_tree::SessionTree;
-use super::terminal_tabs::{TabInfo, TerminalTabs};
+use super::terminal_tabs::{TabContextMenuState, TabInfo, TerminalTabs};
 use super::terminal_view::TerminalView;
 
 /// Minimum session tree width in pixels
@@ -110,6 +110,161 @@ impl MainWindow {
         })
     }
 
+    /// Render tab context menu at window level
+    fn render_tab_context_menu(&self, menu: &TabContextMenuState, cx: &mut Context<Self>) -> impl IntoElement {
+        let tab_id = menu.tab_id;
+        let tab_index = menu.tab_index;
+        let tab_count = menu.tab_count;
+        let has_tabs_to_right = tab_index < tab_count.saturating_sub(1);
+        let has_tabs_to_left = tab_index > 0;
+        let has_other_tabs = tab_count > 1;
+
+        let tabs_view = self.tabs_view.clone();
+
+        div()
+            .absolute()
+            .left(menu.position.x)
+            .top(menu.position.y)
+            .w(px(180.0))
+            .bg(rgb(0x313244))
+            .border_1()
+            .border_color(rgb(0x45475a))
+            .rounded_md()
+            .shadow_lg()
+            .py_1()
+            // Close Tab
+            .child(
+                div()
+                    .id("ctx-close-tab")
+                    .px_3()
+                    .py_1()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(0x45475a)))
+                    .on_click({
+                        let tabs_view = tabs_view.clone();
+                        cx.listener(move |_this, _event, window, cx| {
+                            tabs_view.update(cx, |view, cx| {
+                                view.close_tab_action(tab_id, window, cx);
+                            });
+                        })
+                    })
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0xcdd6f4))
+                            .child("Close Tab"),
+                    ),
+            )
+            // Separator
+            .child(
+                div()
+                    .h(px(1.0))
+                    .mx_2()
+                    .my_1()
+                    .bg(rgb(0x45475a)),
+            )
+            // Close Other Tabs
+            .child(
+                div()
+                    .id("ctx-close-other")
+                    .px_3()
+                    .py_1()
+                    .when(has_other_tabs, |this| {
+                        let tabs_view = tabs_view.clone();
+                        this.cursor_pointer()
+                            .hover(|s| s.bg(rgb(0x45475a)))
+                            .on_click(cx.listener(move |_this, _event, window, cx| {
+                                tabs_view.update(cx, |view, cx| {
+                                    view.close_other_tabs_action(tab_id, window, cx);
+                                });
+                            }))
+                    })
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(if has_other_tabs { rgb(0xcdd6f4) } else { rgb(0x6c7086) })
+                            .child("Close Other Tabs"),
+                    ),
+            )
+            // Close Tabs to the Right
+            .child(
+                div()
+                    .id("ctx-close-right")
+                    .px_3()
+                    .py_1()
+                    .when(has_tabs_to_right, |this| {
+                        let tabs_view = tabs_view.clone();
+                        this.cursor_pointer()
+                            .hover(|s| s.bg(rgb(0x45475a)))
+                            .on_click(cx.listener(move |_this, _event, window, cx| {
+                                tabs_view.update(cx, |view, cx| {
+                                    view.close_tabs_to_right_action(tab_index, window, cx);
+                                });
+                            }))
+                    })
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(if has_tabs_to_right { rgb(0xcdd6f4) } else { rgb(0x6c7086) })
+                            .child("Close Tabs to the Right"),
+                    ),
+            )
+            // Close Tabs to the Left
+            .child(
+                div()
+                    .id("ctx-close-left")
+                    .px_3()
+                    .py_1()
+                    .when(has_tabs_to_left, |this| {
+                        let tabs_view = tabs_view.clone();
+                        this.cursor_pointer()
+                            .hover(|s| s.bg(rgb(0x45475a)))
+                            .on_click(cx.listener(move |_this, _event, window, cx| {
+                                tabs_view.update(cx, |view, cx| {
+                                    view.close_tabs_to_left_action(tab_index, window, cx);
+                                });
+                            }))
+                    })
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(if has_tabs_to_left { rgb(0xcdd6f4) } else { rgb(0x6c7086) })
+                            .child("Close Tabs to the Left"),
+                    ),
+            )
+            // Separator
+            .child(
+                div()
+                    .h(px(1.0))
+                    .mx_2()
+                    .my_1()
+                    .bg(rgb(0x45475a)),
+            )
+            // Close All Tabs
+            .child(
+                div()
+                    .id("ctx-close-all")
+                    .px_3()
+                    .py_1()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(0x45475a)))
+                    .on_click({
+                        let tabs_view = tabs_view.clone();
+                        cx.listener(move |_this, _event, window, cx| {
+                            tabs_view.update(cx, |view, cx| {
+                                view.close_all_tabs_action(window, cx);
+                            });
+                        })
+                    })
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0xf38ba8))
+                            .child("Close All Tabs"),
+                    ),
+            )
+    }
+
     /// Handle resize end - save width to config
     fn finish_resize(&mut self, cx: &mut Context<Self>) {
         if self.is_resizing {
@@ -149,9 +304,13 @@ impl Render for MainWindow {
         let tree_width = self.session_tree_width;
         let is_resizing = self.is_resizing;
 
+        // Get tab context menu state
+        let tab_context_menu = self.tabs_view.read(cx).context_menu_state();
+
         // Root container with window-level mouse handlers for drag tracking
-        div()
+        let mut root = div()
             .id("main-window-root")
+            .relative()
             .flex()
             .flex_col()
             .size_full()
@@ -293,7 +452,39 @@ impl Render for MainWindow {
                                 if self.terminal_views.len() == 1 { "" } else { "s" }
                             )),
                     ),
-            )
+            );
+
+        // Add tab context menu if open (rendered at window level to avoid clipping)
+        if let Some(menu) = tab_context_menu {
+            let tabs_view = self.tabs_view.clone();
+            // Backdrop to dismiss menu
+            root = root.child(
+                div()
+                    .id("tab-context-menu-backdrop")
+                    .absolute()
+                    .inset_0()
+                    .on_mouse_up(MouseButton::Left, {
+                        let tabs_view = tabs_view.clone();
+                        cx.listener(move |_this, _event: &MouseUpEvent, _window, cx| {
+                            tabs_view.update(cx, |view, cx| {
+                                view.dismiss_context_menu(cx);
+                            });
+                        })
+                    })
+                    .on_mouse_up(MouseButton::Right, {
+                        let tabs_view = tabs_view.clone();
+                        cx.listener(move |_this, _event: &MouseUpEvent, _window, cx| {
+                            tabs_view.update(cx, |view, cx| {
+                                view.dismiss_context_menu(cx);
+                            });
+                        })
+                    }),
+            );
+            // Context menu
+            root = root.child(self.render_tab_context_menu(&menu, cx));
+        }
+
+        root
     }
 }
 

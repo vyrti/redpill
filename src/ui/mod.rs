@@ -16,6 +16,6 @@ pub use main_window::{main_window, open_main_window, MainWindow};
 pub use session_dialog::{session_dialog, edit_session_dialog, SessionDialog, SessionDialogResult};
 pub use session_tree::{session_tree, SessionTree, SessionTreeAction};
 pub use ssm_session_dialog::{ssm_session_dialog, edit_ssm_session_dialog, SsmSessionDialog, SsmSessionDialogResult};
-pub use terminal_tabs::{terminal_tabs, TabAction, TabInfo, TerminalTabs};
+pub use terminal_tabs::{terminal_tabs, TabAction, TabContextMenuState, TabInfo, TerminalTabs};
 pub use terminal_view::{terminal_view, TerminalView};
 pub use text_field::{text_field, text_field_with_content, TextField};
