@@ -11,6 +11,7 @@ use alacritty_terminal::tty::{self, Options as PtyOptions};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb, StdSyncHandler};
 use std::collections::HashMap;
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use tokio::runtime::Handle as TokioHandle;
@@ -109,6 +110,8 @@ pub enum TerminalMode2 {
         backend: Arc<TokioMutex<SshBackend>>,
         /// Sender for write data (doesn't require backend lock)
         write_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+        /// Sender for resize requests (doesn't require backend lock)
+        resize_tx: tokio::sync::mpsc::UnboundedSender<TerminalSize>,
         tokio_handle: TokioHandle,
     },
 }
@@ -127,6 +130,9 @@ pub struct Terminal {
     config: TerminalConfig,
     /// Current title (updated from events)
     title: String,
+    /// Flag indicating new content has been written (for SSH mode)
+    /// This allows the UI to know when to redraw without polling events
+    dirty: Arc<AtomicBool>,
 }
 
 impl Terminal {
@@ -184,6 +190,7 @@ impl Terminal {
             event_rx,
             config,
             title: "Terminal".to_string(),
+            dirty: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -232,9 +239,10 @@ impl Terminal {
         // Spawn the event loop
         let _join_handle = event_loop.spawn();
 
-        // Set up write channel - the actual channel setup happens in take_channel_for_io
-        // after connection, so we just create a placeholder sender here
+        // Set up write and resize channels - the actual channel setup happens in take_channel_for_io
+        // after connection, so we just create placeholder senders here
         let (write_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (resize_tx, _) = tokio::sync::mpsc::unbounded_channel();
 
         let backend_arc = Arc::new(TokioMutex::new(backend));
 
@@ -245,11 +253,13 @@ impl Terminal {
                 notifier,
                 backend: backend_arc,
                 write_tx,
+                resize_tx,
                 tokio_handle,
             },
             event_rx,
             config,
             title: "SSH".to_string(),
+            dirty: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -257,6 +267,13 @@ impl Terminal {
     pub fn set_write_tx(&mut self, tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>) {
         if let TerminalMode2::Remote { write_tx, .. } = &mut self.mode {
             *write_tx = tx;
+        }
+    }
+
+    /// Update the resize sender after I/O setup
+    pub fn set_resize_tx(&mut self, tx: tokio::sync::mpsc::UnboundedSender<TerminalSize>) {
+        if let TerminalMode2::Remote { resize_tx, .. } = &mut self.mode {
+            *resize_tx = tx;
         }
     }
 
@@ -296,6 +313,8 @@ impl Terminal {
                 for &byte in data {
                     processor.advance(&mut *term, byte);
                 }
+                // Signal that new content is available for rendering
+                self.dirty.store(true, Ordering::Release);
             }
         }
     }
@@ -332,6 +351,17 @@ impl Terminal {
             events.push(event);
         }
         events
+    }
+
+    /// Check if new content has been written (for SSH mode)
+    /// Returns true if dirty and clears the flag
+    pub fn take_dirty(&self) -> bool {
+        self.dirty.swap(false, Ordering::AcqRel)
+    }
+
+    /// Get the dirty flag Arc for external polling without locking
+    pub fn dirty_flag(&self) -> Arc<AtomicBool> {
+        self.dirty.clone()
     }
 
     /// Resize the terminal
@@ -371,22 +401,15 @@ impl Terminal {
             TerminalMode2::Local { notifier } => {
                 let _ = notifier.0.send(Msg::Resize(window_size));
             }
-            TerminalMode2::Remote { notifier, backend, tokio_handle, .. } => {
+            TerminalMode2::Remote { notifier, resize_tx, .. } => {
                 // Notify the event loop
                 let _ = notifier.0.send(Msg::Resize(window_size));
 
-                // Notify SSH backend
-                let backend = backend.clone();
-                tokio_handle.spawn(async move {
-                    let mut b = backend.lock().await;
-                    let ssh_size = super::ssh_backend::TerminalSize {
-                        cols: size.cols,
-                        rows: size.rows,
-                        pixel_width: size.pixel_width,
-                        pixel_height: size.pixel_height,
-                    };
-                    let _ = b.resize(ssh_size).await;
-                });
+                // Send resize through channel (handled by I/O loop)
+                tracing::debug!("SSH resize: queuing {}x{}", size.cols, size.rows);
+                if let Err(e) = resize_tx.send(size) {
+                    tracing::error!("SSH resize send error: {}", e);
+                }
             }
         }
     }

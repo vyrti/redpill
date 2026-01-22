@@ -9,7 +9,7 @@ use gpui::*;
 
 use crate::config::AppConfig;
 use crate::session::{LocalSession, Session, SessionGroup, SessionManager, SshSession};
-use crate::terminal::{SshBackend, Terminal, TerminalConfig};
+use crate::terminal::{SshBackend, Terminal, TerminalConfig, TerminalSize};
 
 /// Represents an open terminal tab
 pub struct TerminalTab {
@@ -161,15 +161,41 @@ impl RedPillApp {
                 }
             };
 
-            // Update the terminal's write_tx to point to our new channel
+            // Create resize channel for sending window size changes to I/O loop
+            let (resize_tx, resize_rx) = tokio::sync::mpsc::unbounded_channel();
+
+            // Update the terminal's write_tx and resize_tx to point to our new channels
+            // Also get the current size to send immediately after setup
             let write_tx = backend_for_connect.lock().await.get_write_sender();
-            if let (Some(term_arc), Some(tx)) = (terminal_weak.upgrade(), write_tx) {
+            let current_size = if let (Some(term_arc), Some(tx)) = (terminal_weak.upgrade(), write_tx) {
                 let mut term = term_arc.lock();
                 term.set_write_tx(tx);
+                term.set_resize_tx(resize_tx);
+                Some(term.size())
+            } else {
+                None
+            };
+
+            // Send immediate resize with the terminal's current size
+            // This ensures the SSH server gets correct dimensions even if the first
+            // UI paint happened before the channels were connected
+            if let Some(size) = current_size {
+                if size.cols > 0 && size.rows > 0 {
+                    tracing::info!("SSH immediate resize after channel setup: {}x{} ({}x{} px)",
+                        size.cols, size.rows, size.pixel_width, size.pixel_height);
+                    if let Err(e) = channel.window_change(
+                        size.cols as u32,
+                        size.rows as u32,
+                        size.pixel_width as u32,
+                        size.pixel_height as u32,
+                    ).await {
+                        tracing::error!("SSH immediate resize error: {}", e);
+                    }
+                }
             }
 
             // Start the combined I/O loop using select!
-            spawn_ssh_io_loop(terminal_weak, backend_for_connect, channel, write_rx).await;
+            spawn_ssh_io_loop(terminal_weak, backend_for_connect, channel, write_rx, resize_rx).await;
         });
 
         let tab = TerminalTab {
@@ -347,7 +373,7 @@ impl RedPillApp {
     }
 }
 
-/// Combined SSH I/O loop using tokio::select! for concurrent read/write
+/// Combined SSH I/O loop using tokio::select! for concurrent read/write/resize
 ///
 /// This follows the recommended russh pattern where a single task handles
 /// both reading from the channel and writing user input, using select!
@@ -357,6 +383,7 @@ async fn spawn_ssh_io_loop(
     backend: Arc<TokioMutex<SshBackend>>,
     mut channel: russh::Channel<russh::client::Msg>,
     mut write_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    mut resize_rx: tokio::sync::mpsc::UnboundedReceiver<TerminalSize>,
 ) {
     loop {
         tokio::select! {
@@ -366,6 +393,20 @@ async fn spawn_ssh_io_loop(
                 if let Err(e) = channel.data(&data[..]).await {
                     tracing::error!("SSH write error: {}", e);
                     break;
+                }
+            }
+
+            // Handle resize requests (window resize -> SSH PTY)
+            Some(size) = resize_rx.recv() => {
+                tracing::debug!("SSH resize: sending {}x{}", size.cols, size.rows);
+                if let Err(e) = channel.window_change(
+                    size.cols as u32,
+                    size.rows as u32,
+                    size.pixel_width as u32,
+                    size.pixel_height as u32,
+                ).await {
+                    tracing::error!("SSH resize error: {}", e);
+                    // Don't break on resize error - connection may still be usable
                 }
             }
 

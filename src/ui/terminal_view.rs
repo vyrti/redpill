@@ -43,17 +43,29 @@ impl TerminalView {
 
         let terminal_weak = Arc::downgrade(&terminal);
 
+        // Get dirty flag for lock-free checking of new SSH content
+        let dirty_flag = {
+            let term = terminal.lock();
+            term.dirty_flag()
+        };
+
         // Event-driven update loop - polls for terminal events and handles cursor blink
         cx.spawn(async move |entity, cx| {
             loop {
                 cx.background_executor()
-                    .timer(Duration::from_millis(16))
+                    .timer(Duration::from_millis(2)) // ~500 FPS polling for minimal input latency
                     .await;
 
-                let should_notify = terminal_weak.upgrade().map(|t| {
+                // Check dirty flag first (lock-free, fast path for SSH)
+                let has_new_content = dirty_flag.swap(false, std::sync::atomic::Ordering::AcqRel);
+
+                // Also check for terminal events (title changes, etc.)
+                let has_events = terminal_weak.upgrade().map(|t| {
                     let mut term = t.lock();
                     !term.poll_events().is_empty()
                 }).unwrap_or(false);
+
+                let should_notify = has_new_content || has_events;
 
                 // Handle cursor blinking - always update, render will check focus state
                 let _ = entity.update(cx, |view, cx| {
@@ -98,62 +110,106 @@ impl TerminalView {
 
         let keystroke = &event.keystroke;
 
-        // Skip if platform modifier (Cmd on Mac) is pressed - those are usually shortcuts
+        // Handle paste (Cmd+V on Mac, Ctrl+Shift+V elsewhere)
+        let is_paste = (keystroke.modifiers.platform && keystroke.key == "v")
+            || (keystroke.modifiers.control && keystroke.modifiers.shift && keystroke.key == "v");
+
+        if is_paste {
+            if let Some(item) = cx.read_from_clipboard() {
+                if let Some(text) = item.text() {
+                    // Clear any existing selection before paste
+                    {
+                        let term = self.terminal.lock();
+                        term.clear_selection();
+                    }
+                    self.paste_text(&text);
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+
+        // Handle copy (Cmd+C with selection)
+        if keystroke.modifiers.platform && keystroke.key == "c" {
+            if let Some(text) = self.selected_text() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                // Clear selection after copy
+                {
+                    let term = self.terminal.lock();
+                    term.clear_selection();
+                }
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+            // No selection - fall through to let Ctrl+C work as interrupt
+        }
+
+        // Skip other platform modifier shortcuts
         if keystroke.modifiers.platform {
             return;
         }
 
-        // Get mode and try escape sequence conversion
-        let escape_result = {
+        // Single lock acquisition for mode check and write to minimize latency
+        let handled = {
             let term = self.terminal.lock();
             let mode = term.mode();
-            keystroke_to_escape(keystroke, &mode, false)
-        };
 
-        // If we have an escape sequence, send it
-        if let Some(escape_str) = escape_result {
-            tracing::debug!("Terminal escape sequence: {:?}", escape_str);
-            let term = self.terminal.lock();
-            term.write(escape_str.as_bytes());
-            drop(term);
+            // Try escape sequence conversion
+            if let Some(escape_str) = keystroke_to_escape(keystroke, &mode, false) {
+                tracing::debug!("Terminal escape sequence: {:?}", escape_str);
+                term.write(escape_str.as_bytes());
+                true
+            } else if !keystroke.modifiers.control && !keystroke.modifiers.alt {
+                // Handle regular character input
+                // Use key_char if available (for proper Unicode handling), otherwise key
+                let input = if let Some(key_char) = &keystroke.key_char {
+                    if !key_char.is_empty() && key_char.chars().all(|c| !c.is_control() || c == '\t') {
+                        Some(key_char.to_string())
+                    } else {
+                        None
+                    }
+                } else if keystroke.key.len() == 1 {
+                    let c = keystroke.key.chars().next().unwrap();
+                    // Only send printable ASCII characters
+                    if c.is_ascii_graphic() || c == ' ' {
+                        Some(keystroke.key.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(input) = input {
+                    tracing::debug!("Terminal input: {:?}", input);
+                    term.write(input.as_bytes());
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        }; // Lock released here
+
+        if handled {
             cx.stop_propagation();
             cx.notify();
-            return;
         }
+    }
 
-        // Skip if control or alt is pressed without a matching escape sequence
-        // (those were handled above by keystroke_to_escape)
-        if keystroke.modifiers.control || keystroke.modifiers.alt {
-            return;
-        }
+    /// Paste text, wrapping with bracketed paste sequences if mode is enabled
+    fn paste_text(&self, text: &str) {
+        let term = self.terminal.lock();
+        let mode = term.mode();
 
-        // Handle regular character input
-        // Use key_char if available (for proper Unicode handling), otherwise key
-        let input = if let Some(key_char) = &keystroke.key_char {
-            if !key_char.is_empty() && key_char.chars().all(|c| !c.is_control() || c == '\t') {
-                Some(key_char.to_string())
-            } else {
-                None
-            }
-        } else if keystroke.key.len() == 1 {
-            let c = keystroke.key.chars().next().unwrap();
-            // Only send printable ASCII characters
-            if c.is_ascii_graphic() || c == ' ' {
-                Some(keystroke.key.clone())
-            } else {
-                None
-            }
+        if mode.contains(TermMode::BRACKETED_PASTE) {
+            let bracketed = format!("\x1b[200~{}\x1b[201~", text);
+            term.write(bracketed.as_bytes());
         } else {
-            None
-        };
-
-        if let Some(input) = input {
-            tracing::debug!("Terminal input: {:?}", input);
-            let term = self.terminal.lock();
-            term.write(input.as_bytes());
-            drop(term);
-            cx.stop_propagation();
-            cx.notify();
+            term.write(text.as_bytes());
         }
     }
 
@@ -797,7 +853,13 @@ impl Render for TerminalView {
                             if cols > 0 && rows > 0 {
                                 let mut term = terminal.lock();
                                 let current_size = term.size();
-                                if current_size.cols != cols || current_size.rows != rows {
+
+                                // Resize if dimensions changed OR first paint (pixel dimensions are 0)
+                                let needs_resize = current_size.cols != cols
+                                    || current_size.rows != rows
+                                    || current_size.pixel_width == 0;
+
+                                if needs_resize {
                                     let cell_w: f32 = data.cell_width.into();
                                     let cell_h: f32 = data.cell_height.into();
                                     let pixel_width = (cell_w * cols as f32) as u16;
