@@ -328,6 +328,8 @@ pub struct SshBackend {
     size: TerminalSize,
     /// Read buffer for accumulated data
     read_buffer: Vec<u8>,
+    /// Channel for sending write requests (decoupled from read loop)
+    write_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
 }
 
 impl SshBackend {
@@ -340,6 +342,7 @@ impl SshBackend {
             config,
             size: TerminalSize::new(80, 24),
             read_buffer: Vec::new(),
+            write_tx: None,
         }
     }
 
@@ -539,7 +542,22 @@ impl SshBackend {
         Ok(false)
     }
 
-    /// Write data to the SSH channel
+    /// Set up the write channel sender
+    ///
+    /// Returns a sender that can be used to send write data without holding the backend lock.
+    /// The receiver should be used by the read/write loop to actually send data.
+    pub fn setup_write_channel(&mut self) -> tokio::sync::mpsc::UnboundedReceiver<Vec<u8>> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.write_tx = Some(tx);
+        rx
+    }
+
+    /// Get the write sender for sending data without locking
+    pub fn get_write_sender(&self) -> Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>> {
+        self.write_tx.clone()
+    }
+
+    /// Write data to the SSH channel (requires holding the lock)
     pub async fn write(&mut self, data: &[u8]) -> SshResult<()> {
         let channel = self.channel.as_ref().ok_or(SshError::NotConnected)?;
 
@@ -554,7 +572,38 @@ impl SshBackend {
         Ok(())
     }
 
+    /// Send data through the write channel (doesn't require the lock)
+    pub fn send_write(&self, data: Vec<u8>) -> SshResult<()> {
+        if let Some(tx) = &self.write_tx {
+            tx.send(data).map_err(|_| SshError::ChannelClosed)?;
+            Ok(())
+        } else {
+            Err(SshError::NotConnected)
+        }
+    }
+
+    /// Take the channel out of the backend for direct I/O
+    ///
+    /// This allows the channel to be used directly in a select! loop
+    /// without needing to lock the backend. Returns the channel and
+    /// write receiver for the I/O task.
+    pub fn take_channel_for_io(&mut self) -> Option<(Channel<Msg>, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>)> {
+        let channel = self.channel.take()?;
+        // Create a new write channel since we're taking ownership
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.write_tx = Some(tx);
+        Some((channel, rx))
+    }
+
     /// Read data from the SSH channel
+    ///
+    /// Returns:
+    /// - Ok(n) where n > 0: data was read
+    /// - Ok(0): no data available yet (timeout or non-data protocol message) OR connection closed
+    ///          Check is_alive() to distinguish between these cases
+    /// - Err: connection error
+    ///
+    /// Uses a timeout to periodically release the lock, allowing concurrent writes.
     pub async fn read(&mut self, buf: &mut [u8]) -> SshResult<usize> {
         // First, check if we have buffered data
         if !self.read_buffer.is_empty() {
@@ -566,49 +615,56 @@ impl SshBackend {
 
         let channel = self.channel.as_mut().ok_or(SshError::NotConnected)?;
 
-        // Loop until we get actual data or connection closes
-        loop {
-            match channel.wait().await {
-                Some(ChannelMsg::Data { data }) => {
-                    let len = std::cmp::min(buf.len(), data.len());
-                    buf[..len].copy_from_slice(&data[..len]);
+        // Use a timeout to periodically release the lock, allowing writes to proceed
+        let wait_result = tokio::time::timeout(
+            Duration::from_millis(50),
+            channel.wait()
+        ).await;
 
-                    // Buffer any remaining data
-                    if data.len() > len {
-                        self.read_buffer.extend_from_slice(&data[len..]);
-                    }
+        match wait_result {
+            Ok(Some(ChannelMsg::Data { data })) => {
+                let len = std::cmp::min(buf.len(), data.len());
+                buf[..len].copy_from_slice(&data[..len]);
 
-                    return Ok(len);
+                // Buffer any remaining data
+                if data.len() > len {
+                    self.read_buffer.extend_from_slice(&data[len..]);
                 }
-                Some(ChannelMsg::ExtendedData { data, .. }) => {
-                    // Handle stderr data the same way
-                    let len = std::cmp::min(buf.len(), data.len());
-                    buf[..len].copy_from_slice(&data[..len]);
 
-                    if data.len() > len {
-                        self.read_buffer.extend_from_slice(&data[len..]);
-                    }
+                Ok(len)
+            }
+            Ok(Some(ChannelMsg::ExtendedData { data, .. })) => {
+                // Handle stderr data the same way
+                let len = std::cmp::min(buf.len(), data.len());
+                buf[..len].copy_from_slice(&data[..len]);
 
-                    return Ok(len);
+                if data.len() > len {
+                    self.read_buffer.extend_from_slice(&data[len..]);
                 }
-                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) => {
-                    self.state = ConnectionState::Disconnected;
-                    return Ok(0); // True EOF
-                }
-                Some(ChannelMsg::ExitStatus { exit_status }) => {
-                    tracing::info!("Remote process exited with status: {}", exit_status);
-                    self.state = ConnectionState::Disconnected;
-                    return Ok(0); // Process ended
-                }
-                Some(_) => {
-                    // Other protocol messages (WindowAdjust, Success, etc.)
-                    // Continue looping to get actual data
-                    continue;
-                }
-                None => {
-                    self.state = ConnectionState::Disconnected;
-                    return Err(SshError::ChannelClosed);
-                }
+
+                Ok(len)
+            }
+            Ok(Some(ChannelMsg::Eof)) | Ok(Some(ChannelMsg::Close)) => {
+                self.state = ConnectionState::Disconnected;
+                Ok(0) // True EOF - connection closed
+            }
+            Ok(Some(ChannelMsg::ExitStatus { exit_status })) => {
+                tracing::info!("Remote process exited with status: {}", exit_status);
+                self.state = ConnectionState::Disconnected;
+                Ok(0) // Process ended - connection closed
+            }
+            Ok(Some(_)) => {
+                // Other protocol messages (WindowAdjust, Success, etc.)
+                // Return 0 but keep state as Connected - caller should retry
+                Ok(0)
+            }
+            Ok(None) => {
+                self.state = ConnectionState::Disconnected;
+                Err(SshError::ChannelClosed)
+            }
+            Err(_) => {
+                // Timeout - no data available yet, release lock and let caller retry
+                Ok(0)
             }
         }
     }

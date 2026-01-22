@@ -112,6 +112,7 @@ impl TerminalView {
 
         // If we have an escape sequence, send it
         if let Some(escape_str) = escape_result {
+            tracing::debug!("Terminal escape sequence: {:?}", escape_str);
             let term = self.terminal.lock();
             term.write(escape_str.as_bytes());
             drop(term);
@@ -147,6 +148,7 @@ impl TerminalView {
         };
 
         if let Some(input) = input {
+            tracing::debug!("Terminal input: {:?}", input);
             let term = self.terminal.lock();
             term.write(input.as_bytes());
             drop(term);

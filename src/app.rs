@@ -1,4 +1,5 @@
 use parking_lot::Mutex;
+use russh::ChannelMsg;
 use std::sync::Arc;
 use tokio::runtime::Runtime as TokioRuntime;
 use tokio::sync::Mutex as TokioMutex;
@@ -123,37 +124,52 @@ impl RedPillApp {
         let backend_for_connect = backend_arc.clone();
 
         runtime.spawn(async move {
-            // Connect to SSH server
-            let connect_result = {
+            // Connect to SSH server and take channel for I/O
+            let io_handles = {
                 let mut backend = backend_for_connect.lock().await;
-                backend.connect().await
+                match backend.connect().await {
+                    Ok(()) => {
+                        tracing::info!("SSH connection established");
+                        // Take the channel out of the backend for direct I/O
+                        backend.take_channel_for_io()
+                    }
+                    Err(e) => {
+                        tracing::error!("SSH connection failed: {}", e);
+                        // Display error message in terminal with nice formatting
+                        if let Some(term_arc) = terminal_weak.upgrade() {
+                            let term = term_arc.lock();
+                            let error_text = e.to_string();
+                            let error_msg = format!(
+                                "\x1b[2J\x1b[H\r\n\
+                                \x1b[1;31m  Connection Failed\x1b[0m\r\n\
+                                \r\n\
+                                \x1b[33m  {}\x1b[0m\r\n",
+                                error_text
+                            );
+                            term.write_to_pty(error_msg.as_bytes());
+                        }
+                        return;
+                    }
+                }
             };
 
-            match connect_result {
-                Ok(()) => {
-                    tracing::info!("SSH connection established");
-                }
-                Err(e) => {
-                    tracing::error!("SSH connection failed: {}", e);
-                    // Display error message in terminal with nice formatting
-                    if let Some(term_arc) = terminal_weak.upgrade() {
-                        let term = term_arc.lock();
-                        let error_text = e.to_string();
-                        let error_msg = format!(
-                            "\x1b[2J\x1b[H\r\n\
-                            \x1b[1;31m  Connection Failed\x1b[0m\r\n\
-                            \r\n\
-                            \x1b[33m  {}\x1b[0m\r\n",
-                            error_text
-                        );
-                        term.write_to_pty(error_msg.as_bytes());
-                    }
+            let (channel, write_rx) = match io_handles {
+                Some(handles) => handles,
+                None => {
+                    tracing::error!("Failed to get SSH channel for I/O");
                     return;
                 }
+            };
+
+            // Update the terminal's write_tx to point to our new channel
+            let write_tx = backend_for_connect.lock().await.get_write_sender();
+            if let (Some(term_arc), Some(tx)) = (terminal_weak.upgrade(), write_tx) {
+                let mut term = term_arc.lock();
+                term.set_write_tx(tx);
             }
 
-            // Start reading from SSH and feeding to terminal
-            spawn_ssh_reader(terminal_weak, backend_for_connect).await;
+            // Start the combined I/O loop using select!
+            spawn_ssh_io_loop(terminal_weak, backend_for_connect, channel, write_rx).await;
         });
 
         let tab = TerminalTab {
@@ -331,50 +347,79 @@ impl RedPillApp {
     }
 }
 
-/// Spawn an async task to read from SSH and feed data to terminal
-async fn spawn_ssh_reader(
+/// Combined SSH I/O loop using tokio::select! for concurrent read/write
+///
+/// This follows the recommended russh pattern where a single task handles
+/// both reading from the channel and writing user input, using select!
+/// to multiplex between them without locks.
+async fn spawn_ssh_io_loop(
     terminal: std::sync::Weak<Mutex<Terminal>>,
     backend: Arc<TokioMutex<SshBackend>>,
+    mut channel: russh::Channel<russh::client::Msg>,
+    mut write_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
 ) {
-    let mut buf = vec![0u8; 8192];
-
-    'outer: loop {
-        // Read from SSH
-        let read_result = {
-            let mut b = backend.lock().await;
-            b.read(&mut buf).await
-        };
-
-        match read_result {
-            Ok(0) => {
-                tracing::info!("SSH connection closed (EOF)");
-                // Connection was cleanly closed, try to reconnect
-                if !attempt_reconnect(&terminal, &backend).await {
-                    break 'outer;
+    loop {
+        tokio::select! {
+            // Handle user input (keyboard -> SSH)
+            Some(data) = write_rx.recv() => {
+                tracing::debug!("SSH write: sending {} bytes", data.len());
+                if let Err(e) = channel.data(&data[..]).await {
+                    tracing::error!("SSH write error: {}", e);
+                    break;
                 }
             }
-            Ok(n) => {
-                // Feed data to terminal for display
-                if let Some(term_arc) = terminal.upgrade() {
-                    let term = term_arc.lock();
-                    term.write_to_pty(&buf[..n]);
-                } else {
-                    // Terminal was dropped
-                    tracing::info!("Terminal dropped, stopping SSH reader");
-                    break 'outer;
-                }
-            }
-            Err(e) => {
-                tracing::error!("SSH read error: {}", e);
-                // Connection error, try to reconnect
-                if !attempt_reconnect(&terminal, &backend).await {
-                    break 'outer;
+
+            // Handle SSH channel messages (SSH -> terminal)
+            msg = channel.wait() => {
+                match msg {
+                    Some(ChannelMsg::Data { data }) => {
+                        if let Some(term_arc) = terminal.upgrade() {
+                            let term = term_arc.lock();
+                            term.write_to_pty(&data);
+                        } else {
+                            tracing::info!("Terminal dropped, stopping SSH I/O");
+                            break;
+                        }
+                    }
+                    Some(ChannelMsg::ExtendedData { data, .. }) => {
+                        // Handle stderr
+                        if let Some(term_arc) = terminal.upgrade() {
+                            let term = term_arc.lock();
+                            term.write_to_pty(&data);
+                        } else {
+                            break;
+                        }
+                    }
+                    Some(ChannelMsg::Eof) => {
+                        tracing::info!("SSH channel EOF");
+                        break;
+                    }
+                    Some(ChannelMsg::Close) => {
+                        tracing::info!("SSH channel closed");
+                        break;
+                    }
+                    Some(ChannelMsg::ExitStatus { exit_status }) => {
+                        tracing::info!("Remote process exited with status: {}", exit_status);
+                        break;
+                    }
+                    Some(_) => {
+                        // Other protocol messages (WindowAdjust, Success, etc.)
+                        // Just continue - these don't need special handling
+                    }
+                    None => {
+                        tracing::info!("SSH channel closed (None)");
+                        break;
+                    }
                 }
             }
         }
     }
 
-    // Close SSH connection
+    // Clean up - close the channel
+    let _ = channel.eof().await;
+    let _ = channel.close().await;
+
+    // Update backend state
     let mut b = backend.lock().await;
     let _ = b.close().await;
 }

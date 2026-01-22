@@ -107,6 +107,8 @@ pub enum TerminalMode2 {
     Remote {
         notifier: Notifier,
         backend: Arc<TokioMutex<SshBackend>>,
+        /// Sender for write data (doesn't require backend lock)
+        write_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
         tokio_handle: TokioHandle,
     },
 }
@@ -230,6 +232,10 @@ impl Terminal {
         // Spawn the event loop
         let _join_handle = event_loop.spawn();
 
+        // Set up write channel - the actual channel setup happens in take_channel_for_io
+        // after connection, so we just create a placeholder sender here
+        let (write_tx, _) = tokio::sync::mpsc::unbounded_channel();
+
         let backend_arc = Arc::new(TokioMutex::new(backend));
 
         Ok(Self {
@@ -238,12 +244,20 @@ impl Terminal {
             mode: TerminalMode2::Remote {
                 notifier,
                 backend: backend_arc,
+                write_tx,
                 tokio_handle,
             },
             event_rx,
             config,
             title: "SSH".to_string(),
         })
+    }
+
+    /// Update the write sender after I/O setup
+    pub fn set_write_tx(&mut self, tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>) {
+        if let TerminalMode2::Remote { write_tx, .. } = &mut self.mode {
+            *write_tx = tx;
+        }
     }
 
     /// Get the SSH backend (for spawning reader task)
@@ -294,13 +308,12 @@ impl Terminal {
             TerminalMode2::Local { notifier } => {
                 notifier.notify(data.to_vec());
             }
-            TerminalMode2::Remote { backend, tokio_handle, .. } => {
-                let backend = backend.clone();
-                let data = data.to_vec();
-                tokio_handle.spawn(async move {
-                    let mut b = backend.lock().await;
-                    let _ = b.write(&data).await;
-                });
+            TerminalMode2::Remote { write_tx, .. } => {
+                // Send through the write channel (processed by ssh_write_loop)
+                tracing::debug!("SSH write: queuing {} bytes", data.len());
+                if let Err(e) = write_tx.send(data.to_vec()) {
+                    tracing::error!("SSH write send error: {}", e);
+                }
             }
         }
     }
@@ -358,7 +371,7 @@ impl Terminal {
             TerminalMode2::Local { notifier } => {
                 let _ = notifier.0.send(Msg::Resize(window_size));
             }
-            TerminalMode2::Remote { notifier, backend, tokio_handle } => {
+            TerminalMode2::Remote { notifier, backend, tokio_handle, .. } => {
                 // Notify the event loop
                 let _ = notifier.0.send(Msg::Resize(window_size));
 
