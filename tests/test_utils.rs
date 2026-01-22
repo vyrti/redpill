@@ -52,7 +52,7 @@ pub fn create_test_ssh_session_with_password(name: &str, host: &str, password: &
     let mut session = create_test_ssh_session(name, host);
     session.auth = AuthMethod::Password {
         password: Some(password.to_string()),
-        save_password: false,
+        use_keychain: false,
     };
     session
 }
@@ -63,7 +63,7 @@ pub fn create_test_ssh_session_with_key(name: &str, host: &str, key_path: &str) 
     session.auth = AuthMethod::PrivateKey {
         path: PathBuf::from(key_path),
         passphrase: None,
-        save_passphrase: false,
+        use_keychain: false,
     };
     session
 }

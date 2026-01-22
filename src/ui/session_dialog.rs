@@ -95,11 +95,11 @@ impl SessionDialog {
             match &session.auth {
                 AuthMethod::Password {
                     password,
-                    save_password,
+                    use_keychain,
                 } => (
                     AuthType::Password,
                     password.clone().unwrap_or_default(),
-                    *save_password,
+                    *use_keychain,
                     String::new(),
                     String::new(),
                     false,
@@ -107,14 +107,14 @@ impl SessionDialog {
                 AuthMethod::PrivateKey {
                     path,
                     passphrase,
-                    save_passphrase,
+                    use_keychain,
                 } => (
                     AuthType::PrivateKey,
                     String::new(),
                     false,
                     path.to_string_lossy().to_string(),
                     passphrase.clone().unwrap_or_default(),
-                    *save_passphrase,
+                    *use_keychain,
                 ),
                 AuthMethod::Agent => (
                     AuthType::Agent,
@@ -251,7 +251,7 @@ impl SessionDialog {
                 } else {
                     Some(password)
                 },
-                save_password: self.save_password,
+                use_keychain: self.save_password,
             },
             AuthType::PrivateKey => AuthMethod::PrivateKey {
                 path: PathBuf::from(&key_path),
@@ -260,7 +260,7 @@ impl SessionDialog {
                 } else {
                     Some(key_passphrase)
                 },
-                save_passphrase: self.save_passphrase,
+                use_keychain: self.save_passphrase,
             },
             AuthType::Agent => AuthMethod::Agent,
         };

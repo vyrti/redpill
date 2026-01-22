@@ -37,7 +37,10 @@ impl SessionManager {
     /// Create a new SessionManager, loading existing data from storage
     pub fn new() -> Result<Self, ManagerError> {
         let storage = SessionStorage::new()?;
-        let data = storage.load()?;
+        let mut data = storage.load()?;
+
+        // Load credentials from keychain for SSH sessions
+        Self::load_all_credentials(&mut data);
 
         Ok(Self {
             data,
@@ -48,13 +51,25 @@ impl SessionManager {
 
     /// Create a SessionManager with a custom storage backend
     pub fn with_storage(storage: SessionStorage) -> Result<Self, ManagerError> {
-        let data = storage.load()?;
+        let mut data = storage.load()?;
+
+        // Load credentials from keychain for SSH sessions
+        Self::load_all_credentials(&mut data);
 
         Ok(Self {
             data,
             storage,
             dirty: false,
         })
+    }
+
+    /// Load credentials from keychain for all SSH sessions
+    fn load_all_credentials(data: &mut SessionData) {
+        for session in &mut data.sessions {
+            if let Session::Ssh(ssh_session) = session {
+                ssh_session.load_credentials_from_keychain();
+            }
+        }
     }
 
     /// Get a reference to the current session data
@@ -130,6 +145,12 @@ impl SessionManager {
         match pos {
             Some(index) => {
                 let session = self.data.sessions.remove(index);
+
+                // Delete credentials from keychain if this was an SSH session
+                if let Session::Ssh(ref ssh_session) = session {
+                    ssh_session.delete_credentials_from_keychain();
+                }
+
                 self.dirty = true;
                 tracing::info!("Deleted session: {}", id);
                 Ok(session)
@@ -336,8 +357,20 @@ impl SessionManager {
 
     /// Save changes to storage
     pub fn save(&mut self) -> Result<(), ManagerError> {
+        // Store credentials to keychain before saving
+        // This clears passwords from memory so they don't get serialized to JSON
+        for session in &mut self.data.sessions {
+            if let Session::Ssh(ssh_session) = session {
+                ssh_session.store_credentials_to_keychain();
+            }
+        }
+
         self.storage.save(&self.data)?;
         self.dirty = false;
+
+        // Reload credentials from keychain so they're available in memory
+        Self::load_all_credentials(&mut self.data);
+
         Ok(())
     }
 

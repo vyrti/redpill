@@ -209,7 +209,8 @@ impl Terminal {
         let term = Arc::new(FairMutex::new(term));
 
         // Create PTY options (we still need a PTY for the EventLoop, but it won't be used for SSH data)
-        // Use 'cat' as a silent placeholder - it won't show a prompt and just waits for input
+        // Use 'cat' as a null placeholder - it blocks waiting for stdin and consumes no resources.
+        // SSH data is fed directly via the VT processor, bypassing this dummy PTY entirely.
         let pty_config = PtyOptions {
             shell: Some(tty::Shell::new("/bin/cat".to_string(), vec![])),
             working_directory: None,

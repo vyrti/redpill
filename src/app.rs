@@ -338,37 +338,100 @@ async fn spawn_ssh_reader(
 ) {
     let mut buf = vec![0u8; 8192];
 
-    loop {
+    'outer: loop {
         // Read from SSH
-        let n = {
+        let read_result = {
             let mut b = backend.lock().await;
-            match b.read(&mut buf).await {
-                Ok(0) => {
-                    tracing::info!("SSH connection closed (EOF)");
-                    break;
-                }
-                Ok(n) => n,
-                Err(e) => {
-                    tracing::error!("SSH read error: {}", e);
-                    break;
-                }
-            }
+            b.read(&mut buf).await
         };
 
-        // Feed data to terminal for display
-        if let Some(term_arc) = terminal.upgrade() {
-            let term = term_arc.lock();
-            term.write_to_pty(&buf[..n]);
-        } else {
-            // Terminal was dropped
-            tracing::info!("Terminal dropped, stopping SSH reader");
-            break;
+        match read_result {
+            Ok(0) => {
+                tracing::info!("SSH connection closed (EOF)");
+                // Connection was cleanly closed, try to reconnect
+                if !attempt_reconnect(&terminal, &backend).await {
+                    break 'outer;
+                }
+            }
+            Ok(n) => {
+                // Feed data to terminal for display
+                if let Some(term_arc) = terminal.upgrade() {
+                    let term = term_arc.lock();
+                    term.write_to_pty(&buf[..n]);
+                } else {
+                    // Terminal was dropped
+                    tracing::info!("Terminal dropped, stopping SSH reader");
+                    break 'outer;
+                }
+            }
+            Err(e) => {
+                tracing::error!("SSH read error: {}", e);
+                // Connection error, try to reconnect
+                if !attempt_reconnect(&terminal, &backend).await {
+                    break 'outer;
+                }
+            }
         }
     }
 
     // Close SSH connection
     let mut b = backend.lock().await;
     let _ = b.close().await;
+}
+
+/// Attempt to reconnect to SSH server with exponential backoff
+///
+/// Returns true if reconnection succeeded and we should continue reading,
+/// false if reconnection failed or terminal was dropped.
+async fn attempt_reconnect(
+    terminal: &std::sync::Weak<Mutex<Terminal>>,
+    backend: &Arc<TokioMutex<SshBackend>>,
+) -> bool {
+    // Check if terminal still exists
+    let term_arc = match terminal.upgrade() {
+        Some(t) => t,
+        None => {
+            tracing::info!("Terminal dropped during reconnection");
+            return false;
+        }
+    };
+
+    // Display reconnection message to user
+    {
+        let term = term_arc.lock();
+        let msg = "\r\n\x1b[1;33m  Connection lost. Attempting to reconnect...\x1b[0m\r\n";
+        term.write_to_pty(msg.as_bytes());
+    }
+
+    // Attempt reconnection
+    let result = {
+        let mut b = backend.lock().await;
+        b.reconnect().await
+    };
+
+    match result {
+        Ok(()) => {
+            // Display success message
+            if let Some(term_arc) = terminal.upgrade() {
+                let term = term_arc.lock();
+                let msg = "\r\n\x1b[1;32m  Reconnected successfully!\x1b[0m\r\n";
+                term.write_to_pty(msg.as_bytes());
+            }
+            true
+        }
+        Err(e) => {
+            // Display failure message
+            if let Some(term_arc) = terminal.upgrade() {
+                let term = term_arc.lock();
+                let msg = format!(
+                    "\r\n\x1b[1;31m  Reconnection failed: {}\x1b[0m\r\n",
+                    e
+                );
+                term.write_to_pty(msg.as_bytes());
+            }
+            false
+        }
+    }
 }
 
 /// Global application state wrapper

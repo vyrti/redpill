@@ -9,19 +9,23 @@ use uuid::Uuid;
 pub enum AuthMethod {
     /// Password authentication
     Password {
-        /// The password (None = prompt at connect time)
+        /// The password (None = prompt at connect time, or stored in keychain if use_keychain is true)
+        #[serde(skip_serializing_if = "Option::is_none")]
         password: Option<String>,
-        /// Whether to save the password to disk
-        save_password: bool,
+        /// Whether to save the password to the OS keychain (not plaintext)
+        #[serde(default)]
+        use_keychain: bool,
     },
     /// Private key authentication
     PrivateKey {
         /// Path to the private key file
         path: PathBuf,
-        /// Passphrase for encrypted keys (None = prompt if needed)
+        /// Passphrase for encrypted keys (None = prompt if needed, or stored in keychain)
+        #[serde(skip_serializing_if = "Option::is_none")]
         passphrase: Option<String>,
-        /// Whether to save the passphrase to disk
-        save_passphrase: bool,
+        /// Whether to save the passphrase to the OS keychain (not plaintext)
+        #[serde(default)]
+        use_keychain: bool,
     },
     /// SSH agent authentication
     Agent,
@@ -77,6 +81,95 @@ impl SshSession {
     /// Get the connection address string
     pub fn address(&self) -> String {
         format!("{}:{}", self.host, self.port)
+    }
+
+    /// Store credentials to the OS keychain if use_keychain is enabled.
+    /// After storing, clears the in-memory password/passphrase to prevent
+    /// it from being serialized to JSON.
+    pub fn store_credentials_to_keychain(&mut self) {
+        use super::credentials::{CredentialManager, CredentialType};
+
+        match &mut self.auth {
+            AuthMethod::Password { password, use_keychain } => {
+                if *use_keychain {
+                    if let Some(pwd) = password.take() {
+                        if let Err(e) = CredentialManager::store(
+                            self.id,
+                            CredentialType::Password,
+                            &pwd,
+                        ) {
+                            tracing::warn!("Failed to store password in keychain: {}", e);
+                            // Restore the password so it can be saved in JSON as fallback
+                            *password = Some(pwd);
+                        }
+                    }
+                }
+            }
+            AuthMethod::PrivateKey { passphrase, use_keychain, .. } => {
+                if *use_keychain {
+                    if let Some(pp) = passphrase.take() {
+                        if let Err(e) = CredentialManager::store(
+                            self.id,
+                            CredentialType::Passphrase,
+                            &pp,
+                        ) {
+                            tracing::warn!("Failed to store passphrase in keychain: {}", e);
+                            // Restore the passphrase so it can be saved in JSON as fallback
+                            *passphrase = Some(pp);
+                        }
+                    }
+                }
+            }
+            AuthMethod::Agent => {}
+        }
+    }
+
+    /// Load credentials from the OS keychain if use_keychain is enabled
+    /// and the credential is not already present in memory.
+    pub fn load_credentials_from_keychain(&mut self) {
+        use super::credentials::{CredentialManager, CredentialType};
+
+        match &mut self.auth {
+            AuthMethod::Password { password, use_keychain } => {
+                if *use_keychain && password.is_none() {
+                    match CredentialManager::retrieve(self.id, CredentialType::Password) {
+                        Ok(pwd) => {
+                            *password = Some(pwd);
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                "No password found in keychain for session {}: {}",
+                                self.id,
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+            AuthMethod::PrivateKey { passphrase, use_keychain, .. } => {
+                if *use_keychain && passphrase.is_none() {
+                    match CredentialManager::retrieve(self.id, CredentialType::Passphrase) {
+                        Ok(pp) => {
+                            *passphrase = Some(pp);
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                "No passphrase found in keychain for session {}: {}",
+                                self.id,
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+            AuthMethod::Agent => {}
+        }
+    }
+
+    /// Delete credentials from the OS keychain for this session
+    pub fn delete_credentials_from_keychain(&self) {
+        use super::credentials::CredentialManager;
+        CredentialManager::delete_all(self.id);
     }
 }
 

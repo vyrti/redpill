@@ -4,9 +4,20 @@ use russh::keys::key::PublicKey;
 use russh::{Channel, ChannelMsg, Disconnect};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 
 use crate::session::models::{AuthMethod, SshSession};
+
+/// SSH connection configuration constants
+const CONNECTION_TIMEOUT_SECS: u64 = 5;
+const INACTIVITY_TIMEOUT_SECS: u64 = 300;
+const KEEPALIVE_INTERVAL_SECS: u64 = 30;
+const KEEPALIVE_MAX: usize = 3;
+
+/// Reconnection configuration
+const MAX_RECONNECT_ATTEMPTS: u32 = 3;
+const INITIAL_RECONNECT_DELAY_SECS: u64 = 1;
 
 /// Errors that can occur during SSH operations
 #[derive(Debug, Error)]
@@ -14,8 +25,14 @@ pub enum SshError {
     #[error("Connection failed: {0}")]
     ConnectionFailed(String),
 
+    #[error("Connection timed out after {0} seconds")]
+    ConnectionTimeout(u64),
+
     #[error("Authentication failed: {0}")]
     AuthenticationFailed(String),
+
+    #[error("Host key verification failed: {0}")]
+    HostKeyVerificationFailed(String),
 
     #[error("I/O error: {0}")]
     IoError(#[from] std::io::Error),
@@ -66,15 +83,36 @@ pub enum ConnectionState {
     Failed,
 }
 
+/// Result of host key verification
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostKeyStatus {
+    /// Key matches known_hosts entry
+    Verified,
+    /// Host not in known_hosts, key was added (TOFU)
+    TrustOnFirstUse,
+    /// Key mismatch - potential MITM attack
+    Mismatch,
+    /// Could not verify (e.g., file error)
+    Error(String),
+}
+
 /// SSH client handler for russh
 struct SshClientHandler {
+    /// Server hostname for host key verification
+    hostname: String,
     /// Server host key verification callback result
     verified: bool,
+    /// Host key verification status
+    host_key_status: Option<HostKeyStatus>,
 }
 
 impl SshClientHandler {
-    fn new() -> Self {
-        Self { verified: false }
+    fn new(hostname: &str) -> Self {
+        Self {
+            hostname: hostname.to_string(),
+            verified: false,
+            host_key_status: None,
+        }
     }
 }
 
@@ -82,11 +120,197 @@ impl SshClientHandler {
 impl client::Handler for SshClientHandler {
     type Error = russh::Error;
 
-    async fn check_server_key(&mut self, _server_public_key: &PublicKey) -> Result<bool, Self::Error> {
-        // TODO: Implement proper host key verification
-        // For now, accept all keys (this should be improved for production)
-        self.verified = true;
-        Ok(true)
+    async fn check_server_key(&mut self, server_public_key: &PublicKey) -> Result<bool, Self::Error> {
+        let status = verify_host_key(&self.hostname, server_public_key);
+
+        match &status {
+            HostKeyStatus::Verified => {
+                tracing::info!("Host key verified for {}", self.hostname);
+                self.verified = true;
+                self.host_key_status = Some(status);
+                Ok(true)
+            }
+            HostKeyStatus::TrustOnFirstUse => {
+                tracing::info!("New host key accepted for {} (TOFU)", self.hostname);
+                self.verified = true;
+                self.host_key_status = Some(status);
+                Ok(true)
+            }
+            HostKeyStatus::Mismatch => {
+                tracing::error!(
+                    "HOST KEY VERIFICATION FAILED for {}! Potential MITM attack!",
+                    self.hostname
+                );
+                self.verified = false;
+                self.host_key_status = Some(status);
+                Ok(false)
+            }
+            HostKeyStatus::Error(e) => {
+                tracing::warn!("Host key verification error for {}: {}", self.hostname, e);
+                // On error, we still accept (degrade gracefully) but log the issue
+                self.verified = true;
+                self.host_key_status = Some(status);
+                Ok(true)
+            }
+        }
+    }
+}
+
+/// Path to the known_hosts file
+fn known_hosts_path() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".ssh").join("known_hosts"))
+}
+
+/// Verify a server's host key against known_hosts
+fn verify_host_key(hostname: &str, server_key: &PublicKey) -> HostKeyStatus {
+    let known_hosts_path = match known_hosts_path() {
+        Some(p) => p,
+        None => return HostKeyStatus::Error("Could not determine home directory".to_string()),
+    };
+
+    // Read known_hosts file
+    let contents = match std::fs::read_to_string(&known_hosts_path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // File doesn't exist, use TOFU
+            return add_host_key_to_known_hosts(hostname, server_key);
+        }
+        Err(e) => return HostKeyStatus::Error(format!("Failed to read known_hosts: {}", e)),
+    };
+
+    // Convert russh key to base64 for comparison
+    let server_key_type = key_type_string(server_key);
+    let server_key_base64 = match encode_public_key_base64(server_key) {
+        Ok(k) => k,
+        Err(e) => return HostKeyStatus::Error(format!("Failed to encode server key: {}", e)),
+    };
+
+    // Parse known_hosts and look for matching host
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        // Parse line: hostname key-type key-data [comment]
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 3 {
+            continue;
+        }
+
+        let hosts = parts[0];
+        let key_type = parts[1];
+        let key_data = parts[2];
+
+        // Check if this line matches our hostname
+        if !host_matches(hosts, hostname) {
+            continue;
+        }
+
+        // Found a matching host - check if the key matches
+        if key_type == server_key_type && key_data == server_key_base64 {
+            return HostKeyStatus::Verified;
+        } else if key_type == server_key_type {
+            // Same key type but different key - this is a mismatch!
+            return HostKeyStatus::Mismatch;
+        }
+        // Different key type - continue looking (host might have multiple keys)
+    }
+
+    // Host not found, use TOFU
+    add_host_key_to_known_hosts(hostname, server_key)
+}
+
+/// Check if a hostname pattern matches a hostname
+fn host_matches(pattern: &str, hostname: &str) -> bool {
+    // Handle comma-separated host list
+    for host_pattern in pattern.split(',') {
+        let host_pattern = host_pattern.trim();
+
+        // Handle hashed hosts (start with |)
+        if host_pattern.starts_with('|') {
+            // Hashed hosts are more complex to verify - skip for now
+            continue;
+        }
+
+        // Handle [hostname]:port format
+        let host_pattern = if host_pattern.starts_with('[') {
+            if let Some(end) = host_pattern.find(']') {
+                &host_pattern[1..end]
+            } else {
+                host_pattern
+            }
+        } else {
+            host_pattern
+        };
+
+        // Simple exact match or wildcard
+        if host_pattern == hostname {
+            return true;
+        }
+
+        // Handle wildcard patterns
+        if host_pattern.contains('*') {
+            let pattern = host_pattern.replace("*", ".*");
+            if let Ok(re) = regex_lite::Regex::new(&format!("^{}$", pattern)) {
+                if re.is_match(hostname) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Get the SSH key type string for a public key
+fn key_type_string(key: &PublicKey) -> String {
+    // Use the key's name method which returns the algorithm identifier
+    key.name().to_string()
+}
+
+/// Encode a public key to base64 (SSH wire format)
+fn encode_public_key_base64(key: &PublicKey) -> Result<String, String> {
+    use russh_keys::PublicKeyBase64;
+    Ok(key.public_key_base64())
+}
+
+/// Add a new host key to known_hosts (TOFU)
+fn add_host_key_to_known_hosts(hostname: &str, key: &PublicKey) -> HostKeyStatus {
+    let known_hosts_path = match known_hosts_path() {
+        Some(p) => p,
+        None => return HostKeyStatus::Error("Could not determine home directory".to_string()),
+    };
+
+    // Ensure .ssh directory exists
+    if let Some(ssh_dir) = known_hosts_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(ssh_dir) {
+            return HostKeyStatus::Error(format!("Failed to create .ssh directory: {}", e));
+        }
+    }
+
+    let key_type = key_type_string(key);
+    let key_base64 = match encode_public_key_base64(key) {
+        Ok(k) => k,
+        Err(e) => return HostKeyStatus::Error(e),
+    };
+
+    let entry = format!("{} {} {}\n", hostname, key_type, key_base64);
+
+    // Append to known_hosts
+    use std::io::Write;
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&known_hosts_path)
+    {
+        Ok(mut file) => {
+            if let Err(e) = file.write_all(entry.as_bytes()) {
+                return HostKeyStatus::Error(format!("Failed to write to known_hosts: {}", e));
+            }
+            tracing::info!("Added host key for {} to known_hosts", hostname);
+            HostKeyStatus::TrustOnFirstUse
+        }
+        Err(e) => HostKeyStatus::Error(format!("Failed to open known_hosts: {}", e)),
     }
 }
 
@@ -123,20 +347,36 @@ impl SshBackend {
     pub async fn connect(&mut self) -> SshResult<()> {
         self.state = ConnectionState::Connecting;
 
-        // Create russh client config
-        let ssh_config = client::Config::default();
+        // Create russh client config with timeouts and keepalive
+        let ssh_config = client::Config {
+            inactivity_timeout: Some(Duration::from_secs(INACTIVITY_TIMEOUT_SECS)),
+            keepalive_interval: Some(Duration::from_secs(KEEPALIVE_INTERVAL_SECS)),
+            keepalive_max: KEEPALIVE_MAX,
+            ..Default::default()
+        };
         let ssh_config = Arc::new(ssh_config);
 
-        // Connect to the server
+        // Connect to the server with timeout
         let addr = format!("{}:{}", self.config.host, self.config.port);
         tracing::info!("Connecting to SSH server: {}", addr);
 
-        let handler = SshClientHandler::new();
-        let mut session = match client::connect(ssh_config, &addr, handler).await {
-            Ok(s) => s,
-            Err(e) => {
+        let handler = SshClientHandler::new(&self.config.host);
+        let connect_future = client::connect(ssh_config, &addr, handler);
+
+        let mut session = match tokio::time::timeout(
+            Duration::from_secs(CONNECTION_TIMEOUT_SECS),
+            connect_future,
+        )
+        .await
+        {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
                 self.state = ConnectionState::Failed;
                 return Err(SshError::ConnectionFailed(e.to_string()));
+            }
+            Err(_) => {
+                self.state = ConnectionState::Failed;
+                return Err(SshError::ConnectionTimeout(CONNECTION_TIMEOUT_SECS));
             }
         };
 
@@ -326,46 +566,49 @@ impl SshBackend {
 
         let channel = self.channel.as_mut().ok_or(SshError::NotConnected)?;
 
-        // Wait for data from the channel
-        match channel.wait().await {
-            Some(ChannelMsg::Data { data }) => {
-                let len = std::cmp::min(buf.len(), data.len());
-                buf[..len].copy_from_slice(&data[..len]);
+        // Loop until we get actual data or connection closes
+        loop {
+            match channel.wait().await {
+                Some(ChannelMsg::Data { data }) => {
+                    let len = std::cmp::min(buf.len(), data.len());
+                    buf[..len].copy_from_slice(&data[..len]);
 
-                // Buffer any remaining data
-                if data.len() > len {
-                    self.read_buffer.extend_from_slice(&data[len..]);
+                    // Buffer any remaining data
+                    if data.len() > len {
+                        self.read_buffer.extend_from_slice(&data[len..]);
+                    }
+
+                    return Ok(len);
                 }
+                Some(ChannelMsg::ExtendedData { data, .. }) => {
+                    // Handle stderr data the same way
+                    let len = std::cmp::min(buf.len(), data.len());
+                    buf[..len].copy_from_slice(&data[..len]);
 
-                Ok(len)
-            }
-            Some(ChannelMsg::ExtendedData { data, .. }) => {
-                // Handle stderr data the same way
-                let len = std::cmp::min(buf.len(), data.len());
-                buf[..len].copy_from_slice(&data[..len]);
+                    if data.len() > len {
+                        self.read_buffer.extend_from_slice(&data[len..]);
+                    }
 
-                if data.len() > len {
-                    self.read_buffer.extend_from_slice(&data[len..]);
+                    return Ok(len);
                 }
-
-                Ok(len)
-            }
-            Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) => {
-                self.state = ConnectionState::Disconnected;
-                Ok(0)
-            }
-            Some(ChannelMsg::ExitStatus { exit_status }) => {
-                tracing::info!("Remote process exited with status: {}", exit_status);
-                self.state = ConnectionState::Disconnected;
-                Ok(0)
-            }
-            Some(_) => {
-                // Other message types, try again
-                Ok(0)
-            }
-            None => {
-                self.state = ConnectionState::Disconnected;
-                Err(SshError::ChannelClosed)
+                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) => {
+                    self.state = ConnectionState::Disconnected;
+                    return Ok(0); // True EOF
+                }
+                Some(ChannelMsg::ExitStatus { exit_status }) => {
+                    tracing::info!("Remote process exited with status: {}", exit_status);
+                    self.state = ConnectionState::Disconnected;
+                    return Ok(0); // Process ended
+                }
+                Some(_) => {
+                    // Other protocol messages (WindowAdjust, Success, etc.)
+                    // Continue looping to get actual data
+                    continue;
+                }
+                None => {
+                    self.state = ConnectionState::Disconnected;
+                    return Err(SshError::ChannelClosed);
+                }
             }
         }
     }
@@ -423,6 +666,63 @@ impl SshBackend {
             "{}@{}:{}",
             self.config.username, self.config.host, self.config.port
         )
+    }
+
+    /// Attempt to reconnect with exponential backoff
+    ///
+    /// Returns Ok(()) if reconnection succeeds, Err if all attempts fail.
+    pub async fn reconnect(&mut self) -> SshResult<()> {
+        let mut delay_secs = INITIAL_RECONNECT_DELAY_SECS;
+
+        for attempt in 1..=MAX_RECONNECT_ATTEMPTS {
+            tracing::info!(
+                "Reconnection attempt {}/{} to {} (waiting {}s)",
+                attempt,
+                MAX_RECONNECT_ATTEMPTS,
+                self.description(),
+                delay_secs
+            );
+
+            // Wait before attempting reconnection
+            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+
+            // Clean up any existing connection state
+            self.session = None;
+            self.channel = None;
+            self.read_buffer.clear();
+            self.state = ConnectionState::Disconnected;
+
+            // Attempt to connect
+            match self.connect().await {
+                Ok(()) => {
+                    tracing::info!("Reconnection successful on attempt {}", attempt);
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Reconnection attempt {} failed: {}",
+                        attempt,
+                        e
+                    );
+
+                    if attempt < MAX_RECONNECT_ATTEMPTS {
+                        // Exponential backoff
+                        delay_secs *= 2;
+                    }
+                }
+            }
+        }
+
+        self.state = ConnectionState::Failed;
+        Err(SshError::ConnectionFailed(format!(
+            "Failed to reconnect after {} attempts",
+            MAX_RECONNECT_ATTEMPTS
+        )))
+    }
+
+    /// Get access to session config for reconnection
+    pub fn config(&self) -> &SshSession {
+        &self.config
     }
 }
 
