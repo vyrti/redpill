@@ -277,6 +277,24 @@ impl Default for SessionTreeSettings {
     }
 }
 
+/// Agent panel settings
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentPanelSettings {
+    /// Panel width in pixels
+    pub width: u32,
+    /// Whether the panel is visible
+    pub visible: bool,
+}
+
+impl Default for AgentPanelSettings {
+    fn default() -> Self {
+        Self {
+            width: 360,
+            visible: true,
+        }
+    }
+}
+
 /// Keyboard shortcut definitions
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyBindings {
@@ -325,6 +343,10 @@ pub struct AppConfig {
     #[serde(default)]
     pub session_tree: SessionTreeSettings,
 
+    /// Agent panel settings
+    #[serde(default)]
+    pub agent_panel: AgentPanelSettings,
+
     /// Key bindings
     #[serde(default)]
     pub keybindings: KeyBindings,
@@ -352,6 +374,7 @@ impl Default for AppConfig {
             window: WindowState::default(),
             appearance: TerminalAppearance::default(),
             session_tree: SessionTreeSettings::default(),
+            agent_panel: AgentPanelSettings::default(),
             keybindings: KeyBindings::default(),
             scrollback_lines: 10000,
             confirm_close: true,

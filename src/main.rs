@@ -2,6 +2,7 @@ mod app;
 mod config;
 mod kubernetes;
 mod session;
+mod sftp;
 mod terminal;
 mod ui;
 

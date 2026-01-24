@@ -816,6 +816,111 @@ impl Terminal {
             result.join("\n")
         })
     }
+
+    /// Search for a query in the terminal content
+    /// Returns matches as (line_offset_from_bottom, column, length) tuples
+    /// line_offset is how many lines from the bottom of history (0 = current screen bottom)
+    pub fn search(&self, query: &str, case_sensitive: bool) -> Vec<(i32, usize, usize)> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+
+        let search_query = if case_sensitive {
+            query.to_string()
+        } else {
+            query.to_lowercase()
+        };
+
+        self.with_term(|term| {
+            let screen_lines = term.screen_lines();
+            let history_size = term.history_size();
+            let columns = term.columns();
+            let grid = term.grid();
+
+            let mut matches = Vec::new();
+
+            // Search from top of history to bottom of screen
+            // Line indices: -history_size to screen_lines-1
+            for line_offset in 0..(history_size + screen_lines) {
+                let line = if line_offset < history_size {
+                    Line(-((history_size - line_offset) as i32))
+                } else {
+                    Line((line_offset - history_size) as i32)
+                };
+
+                // Build line text
+                let mut line_text = String::with_capacity(columns);
+                for col_idx in 0..columns {
+                    let pt = Point::new(line, Column(col_idx));
+                    let cell = &grid[pt];
+                    if cell.c == '\0' {
+                        line_text.push(' ');
+                    } else {
+                        line_text.push(cell.c);
+                    }
+                }
+
+                // Search in line
+                let search_in = if case_sensitive {
+                    line_text.clone()
+                } else {
+                    line_text.to_lowercase()
+                };
+
+                let mut start = 0;
+                while let Some(pos) = search_in[start..].find(&search_query) {
+                    let col = start + pos;
+                    // Store as line index (for display) and column
+                    matches.push((line.0, col, query.len()));
+                    start = col + 1;
+                    if start >= search_in.len() {
+                        break;
+                    }
+                }
+            }
+
+            matches
+        })
+    }
+
+    /// Get display offset for scrolling
+    pub fn display_offset(&self) -> usize {
+        self.with_term(|term| term.grid().display_offset())
+    }
+
+    /// Get history size
+    pub fn history_size(&self) -> usize {
+        self.with_term(|term| term.history_size())
+    }
+
+    /// Scroll to make a specific line visible
+    /// line is the line index (negative for history, 0+ for screen)
+    pub fn scroll_to_line(&self, target_line: i32) {
+        self.with_term_mut(|term| {
+            let screen_lines = term.screen_lines() as i32;
+            let history_size = term.history_size() as i32;
+
+            // Calculate required display offset to show target line
+            // If target_line is negative (in history), we need display_offset > 0
+            // If target_line is in current screen (0 to screen_lines-1), display_offset = 0
+
+            if target_line < 0 {
+                // Target is in history
+                // display_offset is how many lines into history we're scrolled
+                // target_line of -1 means 1 line into history
+                let needed_offset = (-target_line) as usize;
+                let max_offset = history_size as usize;
+                let offset = needed_offset.min(max_offset);
+                term.scroll_display(alacritty_terminal::grid::Scroll::Delta(offset as i32));
+            } else if target_line >= screen_lines {
+                // Target is below visible screen (shouldn't happen)
+                term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
+            } else {
+                // Target is on current screen
+                term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
+            }
+        });
+    }
 }
 
 impl Drop for Terminal {

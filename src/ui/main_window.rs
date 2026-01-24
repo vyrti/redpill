@@ -1,19 +1,26 @@
 use gpui::*;
 use gpui::prelude::*;
+use parking_lot::Mutex;
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::app::AppState;
+use crate::terminal::Terminal;
 
 use super::agent_panel::{AgentPanel, AgentPanelEvent};
 use super::quit_confirm_dialog::QuitConfirmDialog;
 use super::session_tree::SessionTree;
+use super::split_container::SplitContainer;
 use super::terminal_tabs::{TabContextMenuState, TabInfo, TerminalTabs};
-use super::terminal_view::TerminalView;
 
 /// Minimum session tree width in pixels
 const MIN_TREE_WIDTH: f32 = 150.0;
 /// Maximum session tree width in pixels
 const MAX_TREE_WIDTH: f32 = 500.0;
+/// Minimum agent panel width in pixels
+const MIN_AGENT_WIDTH: f32 = 280.0;
+/// Maximum agent panel width in pixels
+const MAX_AGENT_WIDTH: f32 = 800.0;
 
 /// Main window component
 pub struct MainWindow {
@@ -23,8 +30,8 @@ pub struct MainWindow {
     tabs_view: Entity<TerminalTabs>,
     /// Agent panel view
     agent_panel: Entity<AgentPanel>,
-    /// Current terminal views (one per tab)
-    terminal_views: Vec<(Uuid, Entity<TerminalView>)>,
+    /// Current split containers (one per tab)
+    split_containers: Vec<(Uuid, Entity<SplitContainer>)>,
     /// Active terminal tab ID
     active_tab_id: Option<Uuid>,
     /// Previously active tab ID (to detect changes)
@@ -33,6 +40,10 @@ pub struct MainWindow {
     session_tree_width: f32,
     /// Whether currently resizing the session tree
     is_resizing: bool,
+    /// Agent panel width in pixels
+    agent_panel_width: f32,
+    /// Whether currently resizing the agent panel
+    is_resizing_agent: bool,
     /// Whether the agent panel is visible
     agent_panel_visible: bool,
     /// Subscriptions
@@ -63,21 +74,29 @@ impl MainWindow {
             }
         });
 
-        // Get initial session tree width from config
-        let session_tree_width = cx
+        // Get initial widths from config
+        let (session_tree_width, agent_panel_width) = cx
             .try_global::<AppState>()
-            .map(|state| state.app.lock().config.session_tree.width as f32)
-            .unwrap_or(250.0);
+            .map(|state| {
+                let app = state.app.lock();
+                (
+                    app.config.session_tree.width as f32,
+                    app.config.agent_panel.width as f32,
+                )
+            })
+            .unwrap_or((250.0, 360.0));
 
         Self {
             session_tree,
             tabs_view,
             agent_panel,
-            terminal_views: Vec::new(),
+            split_containers: Vec::new(),
             active_tab_id: None,
             prev_active_tab_id: None,
             session_tree_width,
             is_resizing: false,
+            agent_panel_width,
+            is_resizing_agent: false,
             agent_panel_visible: true,
             _subscriptions: vec![agent_subscription],
         }
@@ -99,7 +118,7 @@ impl MainWindow {
             let new_tabs: Vec<_> = app
                 .tabs
                 .iter()
-                .filter(|tab| !self.terminal_views.iter().any(|(id, _)| *id == tab.id))
+                .filter(|tab| !self.split_containers.iter().any(|(id, _)| *id == tab.id))
                 .map(|tab| (tab.id, tab.terminal.clone(), tab.color_scheme.clone()))
                 .collect();
 
@@ -117,20 +136,20 @@ impl MainWindow {
 
         self.active_tab_id = active_tab;
 
-        // Create terminal views for new tabs
+        // Create split containers for new tabs
         for (tab_id, terminal, color_scheme) in new_tabs {
-            let view = cx.new(|cx| TerminalView::new(terminal, color_scheme, cx));
-            self.terminal_views.push((tab_id, view));
+            let container = cx.new(|cx| SplitContainer::new(terminal, color_scheme, cx));
+            self.split_containers.push((tab_id, container));
         }
 
-        // Remove views for closed tabs
-        self.terminal_views.retain(|(id, _)| tab_ids.contains(id));
+        // Remove containers for closed tabs
+        self.split_containers.retain(|(id, _)| tab_ids.contains(id));
     }
 
-    /// Get the active terminal view
-    fn active_terminal_view(&self) -> Option<&Entity<TerminalView>> {
+    /// Get the active split container
+    fn active_split_container(&self) -> Option<&Entity<SplitContainer>> {
         self.active_tab_id.and_then(|id| {
-            self.terminal_views.iter().find(|(tid, _)| *tid == id).map(|(_, v)| v)
+            self.split_containers.iter().find(|(tid, _)| *tid == id).map(|(_, v)| v)
         })
     }
 
@@ -302,6 +321,139 @@ impl MainWindow {
             cx.notify();
         }
     }
+
+    /// Handle agent panel resize end - save width to config
+    fn finish_agent_resize(&mut self, cx: &mut Context<Self>) {
+        if self.is_resizing_agent {
+            self.is_resizing_agent = false;
+            // Save width to config
+            if let Some(app_state) = cx.try_global::<AppState>() {
+                let mut app = app_state.app.lock();
+                app.config.agent_panel.width = self.agent_panel_width as u32;
+                let _ = app.config.save();
+            }
+            cx.notify();
+        }
+    }
+
+    /// Split the active pane horizontally (left/right)
+    fn split_horizontal(&mut self, cx: &mut Context<Self>) {
+        if let Some(container) = self.active_split_container().cloned() {
+            // Create a new local terminal for the split
+            if let Some(new_terminal) = self.create_local_terminal(cx) {
+                container.update(cx, |split, cx| {
+                    split.split_horizontal(new_terminal, cx);
+                });
+            }
+        }
+    }
+
+    /// Split the active pane vertically (top/bottom)
+    fn split_vertical(&mut self, cx: &mut Context<Self>) {
+        if let Some(container) = self.active_split_container().cloned() {
+            // Create a new local terminal for the split
+            if let Some(new_terminal) = self.create_local_terminal(cx) {
+                container.update(cx, |split, cx| {
+                    split.split_vertical(new_terminal, cx);
+                });
+            }
+        }
+    }
+
+    /// Close the active pane (or tab if single pane)
+    fn close_active_pane(&mut self, cx: &mut Context<Self>) {
+        if let Some(container) = self.active_split_container().cloned() {
+            let closed = container.update(cx, |split, cx| {
+                split.close_active_pane(cx)
+            });
+            if !closed {
+                // Single pane - close the tab instead
+                if let Some(tab_id) = self.active_tab_id {
+                    if let Some(app_state) = cx.try_global::<AppState>() {
+                        let mut app = app_state.app.lock();
+                        app.close_tab(tab_id);
+                    }
+                }
+            }
+            cx.notify();
+        }
+    }
+
+    /// Focus next pane in the active split container
+    fn focus_next_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(container) = self.active_split_container().cloned() {
+            container.update(cx, |split, cx| {
+                split.focus_next_pane(window, cx);
+            });
+        }
+    }
+
+    /// Focus previous pane in the active split container
+    fn focus_prev_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(container) = self.active_split_container().cloned() {
+            container.update(cx, |split, cx| {
+                split.focus_prev_pane(window, cx);
+            });
+        }
+    }
+
+    /// Create a new local terminal
+    fn create_local_terminal(&self, cx: &Context<Self>) -> Option<Arc<Mutex<Terminal>>> {
+        let scrollback = cx
+            .try_global::<AppState>()
+            .map(|state| state.app.lock().config.scrollback_lines)
+            .unwrap_or(10000);
+
+        let config = crate::terminal::TerminalConfig {
+            scrollback_lines: scrollback,
+            ..Default::default()
+        };
+
+        match Terminal::new_local(config) {
+            Ok(terminal) => Some(Arc::new(Mutex::new(terminal))),
+            Err(e) => {
+                tracing::error!("Failed to create terminal for split: {}", e);
+                None
+            }
+        }
+    }
+
+    /// Handle keyboard shortcuts
+    fn handle_key_input(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let keystroke = &event.keystroke;
+
+        // Split horizontal: Cmd+D (Mac) or Ctrl+Shift+D
+        if (keystroke.modifiers.platform && keystroke.key == "d")
+            || (keystroke.modifiers.control && keystroke.modifiers.shift && keystroke.key == "d")
+        {
+            self.split_horizontal(cx);
+            cx.stop_propagation();
+            return;
+        }
+
+        // Split vertical: Cmd+Shift+D (Mac) or Ctrl+Shift+E
+        if (keystroke.modifiers.platform && keystroke.modifiers.shift && keystroke.key == "d")
+            || (keystroke.modifiers.control && keystroke.modifiers.shift && keystroke.key == "e")
+        {
+            self.split_vertical(cx);
+            cx.stop_propagation();
+            return;
+        }
+
+        // Focus next pane: Cmd+] or Ctrl+]
+        if (keystroke.modifiers.platform || keystroke.modifiers.control) && keystroke.key == "]" {
+            self.focus_next_pane(window, cx);
+            cx.stop_propagation();
+            return;
+        }
+
+        // Focus prev pane: Cmd+[ or Ctrl+[
+        if (keystroke.modifiers.platform || keystroke.modifiers.control) && keystroke.key == "[" {
+            self.focus_prev_pane(window, cx);
+            cx.stop_propagation();
+            return;
+        }
+    }
 }
 
 impl Render for MainWindow {
@@ -309,12 +461,12 @@ impl Render for MainWindow {
         // Sync terminal views with app state
         self.sync_tabs_from_state(cx);
 
-        // Focus terminal view when active tab changes
+        // Focus split container when active tab changes
         if self.active_tab_id != self.prev_active_tab_id {
             self.prev_active_tab_id = self.active_tab_id;
-            if let Some(view) = self.active_terminal_view().cloned() {
-                view.update(cx, |terminal_view, cx| {
-                    terminal_view.focus(window, cx);
+            if let Some(container) = self.active_split_container().cloned() {
+                container.update(cx, |split_container, cx| {
+                    split_container.focus_active_pane(window, cx);
                 });
             }
         }
@@ -327,9 +479,15 @@ impl Render for MainWindow {
 
         let tree_width = self.session_tree_width;
         let is_resizing = self.is_resizing;
+        let agent_width = self.agent_panel_width;
+        let is_resizing_agent = self.is_resizing_agent;
 
         // Get tab context menu state
         let tab_context_menu = self.tabs_view.read(cx).context_menu_state();
+
+        // Get window width for agent panel resize calculation
+        let window_bounds = window.bounds();
+        let window_width: f32 = window_bounds.size.width.into();
 
         // Root container with window-level mouse handlers for drag tracking
         let mut root = div()
@@ -339,6 +497,8 @@ impl Render for MainWindow {
             .flex_col()
             .size_full()
             .bg(rgb(0x1e1e2e))
+            // Handle split keyboard shortcuts
+            .on_key_down(cx.listener(Self::handle_key_input))
             // Window-level mouse move handler for resize dragging
             .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
                 if this.is_resizing {
@@ -347,14 +507,23 @@ impl Render for MainWindow {
                     this.session_tree_width = new_width;
                     cx.notify();
                 }
+                if this.is_resizing_agent {
+                    let x: f32 = event.position.x.into();
+                    // Agent panel width is measured from the right edge
+                    let new_width = (window_width - x).clamp(MIN_AGENT_WIDTH, MAX_AGENT_WIDTH);
+                    this.agent_panel_width = new_width;
+                    cx.notify();
+                }
             }))
             // Window-level mouse up handler to end resize
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _event, _window, cx| {
                 this.finish_resize(cx);
+                this.finish_agent_resize(cx);
             }))
             // Also handle mouse up outside window (when dragged out)
             .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _event, _window, cx| {
                 this.finish_resize(cx);
+                this.finish_agent_resize(cx);
             }))
             .child(
                 // Main content area
@@ -428,15 +597,15 @@ impl Render for MainWindow {
                             .overflow_hidden()
                             // Tab bar
                             .child(self.tabs_view.clone())
-                            // Terminal view
+                            // Terminal split container
                             .child(
                                 div()
                                     .flex_1()
                                     .overflow_hidden()
-                                    .when_some(self.active_terminal_view().cloned(), |el, view| {
-                                        el.child(view)
+                                    .when_some(self.active_split_container().cloned(), |el, container| {
+                                        el.child(container)
                                     })
-                                    .when(self.active_terminal_view().is_none(), |this| {
+                                    .when(self.active_split_container().is_none(), |this| {
                                         this.flex()
                                             .items_center()
                                             .justify_center()
@@ -448,9 +617,30 @@ impl Render for MainWindow {
                                     }),
                             ),
                     )
-                    // Agent panel (right sidebar)
+                    // Agent panel resize handle
                     .when(self.agent_panel_visible, |this| {
-                        this.child(self.agent_panel.clone())
+                        this.child(
+                            div()
+                                .id("agent-resize-handle")
+                                .w(px(6.0))
+                                .h_full()
+                                .cursor_col_resize()
+                                .when(is_resizing_agent, |s| s.bg(rgb(0x89b4fa)))
+                                .when(!is_resizing_agent, |s| s.hover(|h| h.bg(rgb(0x45475a))))
+                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _event, _window, cx| {
+                                    this.is_resizing_agent = true;
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    // Agent panel (right sidebar) with dynamic width
+                    .when(self.agent_panel_visible, |this| {
+                        this.child(
+                            div()
+                                .w(px(agent_width))
+                                .h_full()
+                                .child(self.agent_panel.clone())
+                        )
                     })
                     // Agent panel toggle button (when panel is hidden)
                     .when(!self.agent_panel_visible, |this| {
@@ -503,8 +693,8 @@ impl Render for MainWindow {
                             .text_color(rgb(0x6c7086))
                             .child(format!(
                                 "{} tab{}",
-                                self.terminal_views.len(),
-                                if self.terminal_views.len() == 1 { "" } else { "s" }
+                                self.split_containers.len(),
+                                if self.split_containers.len() == 1 { "" } else { "s" }
                             )),
                     ),
             );

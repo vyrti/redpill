@@ -165,17 +165,21 @@ impl Render for TextField {
         let cursor_pos = self.cursor_pos;
         let placeholder = self.placeholder.clone();
 
+        // Collect chars for character-by-character rendering (enables wrapping)
+        let chars: Vec<char> = display_text.chars().collect();
+
         div()
             .id("text-field")
             .track_focus(&self.focus_handle)
-            .flex()
-            .items_center()
             .w_full()
+            .min_h(px(32.0))
+            .max_h(px(80.0))  // Max ~3 lines
             .px_2()
             .py_1()
             .bg(rgb(0x313244))
             .rounded_md()
             .border_1()
+            .overflow_y_scroll()
             .when(is_focused, |this| {
                 this.border_color(rgb(0x89b4fa))
             })
@@ -242,50 +246,63 @@ impl Render for TextField {
             }))
             .child(
                 div()
-                    .flex()
-                    .flex_1()
-                    .items_center()
+                    .w_full()
                     .text_sm()
-                    .overflow_hidden()
+                    .line_height(px(18.0))
                     .when(!has_content, |this| {
-                        this.text_color(rgb(0x585b70))
+                        this.flex()
+                            .items_center()
+                            .text_color(rgb(0x585b70))
                             .italic()
                             .child(placeholder)
+                            .when(is_focused, |el| {
+                                // Show cursor in empty field when focused
+                                el.child(
+                                    div()
+                                        .w(px(1.0))
+                                        .h(px(14.0))
+                                        .bg(rgb(0xcdd6f4))
+                                )
+                            })
                     })
                     .when(has_content, |this| {
+                        // Render each character as inline span for proper wrapping
                         this.text_color(rgb(0xcdd6f4))
                             .child(
                                 div()
+                                    .w_full()
                                     .flex()
+                                    .flex_wrap()
                                     .items_center()
-                                    .child(
-                                        // Text before cursor
-                                        div().child(display_text[..cursor_pos].to_string())
-                                    )
-                                    .when(is_focused, |this| {
-                                        // Cursor
-                                        this.child(
+                                    .children(chars.iter().enumerate().flat_map(|(idx, ch)| {
+                                        let mut elements: Vec<Div> = Vec::new();
+
+                                        // Insert cursor before this character if position matches
+                                        if idx == cursor_pos && is_focused {
+                                            elements.push(
+                                                div()
+                                                    .w(px(1.0))
+                                                    .h(px(14.0))
+                                                    .bg(rgb(0xcdd6f4))
+                                            );
+                                        }
+
+                                        // Character itself - use whitespace-pre to preserve spaces
+                                        let ch_str = if *ch == ' ' { "\u{00A0}".to_string() } else { ch.to_string() };
+                                        elements.push(div().child(ch_str));
+
+                                        elements
+                                    }))
+                                    // Cursor at end if cursor_pos == chars.len()
+                                    .when(cursor_pos == chars.len() && is_focused, |el| {
+                                        el.child(
                                             div()
                                                 .w(px(1.0))
                                                 .h(px(14.0))
                                                 .bg(rgb(0xcdd6f4))
                                         )
                                     })
-                                    .child(
-                                        // Text after cursor
-                                        div().child(display_text[cursor_pos..].to_string())
-                                    )
                             )
-                    })
-                    .when(!has_content && is_focused, |this| {
-                        // Show cursor in empty field when focused
-                        this.children([
-                            div()
-                                .w(px(1.0))
-                                .h(px(14.0))
-                                .bg(rgb(0xcdd6f4))
-                                .into_any_element()
-                        ])
                     })
             )
     }

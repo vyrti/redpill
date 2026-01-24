@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use crate::app::AppState;
 use crate::config::ColorScheme;
 use crate::terminal::{keystroke_to_escape, terminal::{color_to_rgb_with_scheme, hex_to_rgb}, Terminal, TerminalSize};
+use super::search_bar::{SearchBar, SearchBarEvent};
 
 /// Cursor blink interval in milliseconds
 const CURSOR_BLINK_INTERVAL_MS: u64 = 500;
@@ -39,6 +40,14 @@ pub struct TerminalView {
     was_focused: bool,
     /// Color scheme override for this terminal (None = use global)
     color_scheme_override: Option<String>,
+    /// Search bar (None when closed)
+    search_bar: Option<Entity<SearchBar>>,
+    /// Current search matches: (line, column, length)
+    search_matches: Vec<(i32, usize, usize)>,
+    /// Current search match index
+    current_search_match: usize,
+    /// Subscriptions
+    _subscriptions: Vec<Subscription>,
 }
 
 impl TerminalView {
@@ -100,6 +109,10 @@ impl TerminalView {
             last_blink_toggle: Instant::now(),
             was_focused: false,
             color_scheme_override,
+            search_bar: None,
+            search_matches: Vec::new(),
+            current_search_match: 0,
+            _subscriptions: Vec::new(),
         }
     }
 
@@ -108,7 +121,101 @@ impl TerminalView {
         window.focus(&self.focus_handle, cx);
     }
 
-    fn handle_key_input(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    /// Open the search bar
+    fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search_bar.is_none() {
+            let search_bar = cx.new(|cx| SearchBar::new(cx));
+
+            // Subscribe to search bar events
+            let subscription = cx.subscribe(&search_bar, |this, search_bar, event, cx| {
+                match event {
+                    SearchBarEvent::Close => {
+                        this.close_search(cx);
+                    }
+                    SearchBarEvent::QueryChanged(query) => {
+                        this.update_search(query, &search_bar, cx);
+                    }
+                    SearchBarEvent::FindNext => {
+                        this.scroll_to_current_match(cx);
+                    }
+                    SearchBarEvent::FindPrev => {
+                        this.scroll_to_current_match(cx);
+                    }
+                }
+            });
+
+            self._subscriptions.push(subscription);
+            self.search_bar = Some(search_bar.clone());
+
+            // Focus the search bar
+            window.focus(&search_bar.focus_handle(cx), cx);
+        } else if let Some(ref search_bar) = self.search_bar {
+            // Already open, just focus it
+            window.focus(&search_bar.focus_handle(cx), cx);
+        }
+        cx.notify();
+    }
+
+    /// Close the search bar
+    fn close_search(&mut self, cx: &mut Context<Self>) {
+        self.search_bar = None;
+        self.search_matches.clear();
+        self.current_search_match = 0;
+        self._subscriptions.clear();
+        cx.notify();
+    }
+
+    /// Update search results based on query
+    fn update_search(&mut self, query: &str, search_bar: &Entity<SearchBar>, cx: &mut Context<Self>) {
+        let case_sensitive = search_bar.read(cx).case_sensitive();
+
+        let matches = {
+            let terminal = self.terminal.lock();
+            terminal.search(query, case_sensitive)
+        };
+
+        let match_count = matches.len();
+        self.search_matches = matches;
+        self.current_search_match = 0;
+
+        // Update search bar with match count
+        search_bar.update(cx, |sb, cx| {
+            sb.set_match_count(match_count, cx);
+        });
+
+        // Scroll to first match if any
+        if match_count > 0 {
+            self.scroll_to_current_match(cx);
+        }
+
+        cx.notify();
+    }
+
+    /// Scroll terminal to show the current search match
+    fn scroll_to_current_match(&mut self, cx: &mut Context<Self>) {
+        if let Some(search_bar) = &self.search_bar {
+            self.current_search_match = search_bar.read(cx).current_match_index();
+        }
+
+        if let Some(&(line, _, _)) = self.search_matches.get(self.current_search_match) {
+            let terminal = self.terminal.lock();
+            terminal.scroll_to_line(line);
+        }
+        cx.notify();
+    }
+
+    /// Check if a cell position is within a search match
+    fn is_search_match(&self, line: i32, col: usize) -> Option<bool> {
+        for (idx, &(match_line, match_col, match_len)) in self.search_matches.iter().enumerate() {
+            if line == match_line && col >= match_col && col < match_col + match_len {
+                // Return true if this is the current match, false otherwise
+                return Some(idx == self.current_search_match);
+            }
+        }
+        None
+    }
+
+    fn handle_key_input(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         // Reset cursor blink on any input
         self.cursor_visible = true;
         self.last_blink_toggle = Instant::now();
@@ -149,6 +256,22 @@ impl TerminalView {
                 return;
             }
             // No selection - fall through to let Ctrl+C work as interrupt
+        }
+
+        // Handle search (Cmd+F on Mac, Ctrl+F elsewhere)
+        let is_search = (keystroke.modifiers.platform && keystroke.key == "f")
+            || (keystroke.modifiers.control && keystroke.key == "f");
+        if is_search {
+            self.open_search(window, cx);
+            cx.stop_propagation();
+            return;
+        }
+
+        // Handle Escape to close search bar
+        if keystroke.key == "escape" && self.search_bar.is_some() {
+            self.close_search(cx);
+            cx.stop_propagation();
+            return;
         }
 
         // Skip other platform modifier shortcuts
@@ -496,6 +619,8 @@ struct TerminalPaintData {
     cursor_color: Hsla,
     /// Scrollbar data: (display_offset, history_size, show_scrollbar)
     scrollbar: Option<(usize, usize)>,
+    /// Search highlight cells: (col, row, is_current_match)
+    search_highlights: Vec<(usize, usize, bool)>,
 }
 
 fn color_to_hsla(color: Color, colors: &alacritty_terminal::term::color::Colors, scheme: &ColorScheme) -> Hsla {
@@ -593,7 +718,11 @@ impl Render for TerminalView {
         // Compute background color from scheme
         let bg_color = rgb_to_hsla(hex_to_rgb(scheme.background));
 
-        div()
+        // Clone search bar for use in render
+        let search_bar_opt = self.search_bar.clone();
+
+        let mut container = div()
+            .relative()
             .size_full()
             .bg(bg_color)
             .track_focus(&self.focus_handle)
@@ -608,6 +737,8 @@ impl Render for TerminalView {
                         let terminal = terminal.clone();
                         let bounds_origin = bounds_origin_for_canvas.clone();
                         let scheme = scheme.clone();
+                        let search_matches = self.search_matches.clone();
+                        let current_search_match = self.current_search_match;
                         move |bounds, window, _cx| {
                             // Update bounds origin for mouse coordinate conversion
                             *bounds_origin.lock() = bounds.origin;
@@ -777,6 +908,21 @@ impl Render for TerminalView {
                                 None
                             };
 
+                            // Build search highlights - convert line offsets to screen positions
+                            let mut search_highlights = Vec::new();
+                            for (idx, &(match_line, match_col, match_len)) in search_matches.iter().enumerate() {
+                                // Convert terminal line to screen row
+                                // match_line is the line index (negative for history, 0+ for screen)
+                                // We need to account for display_offset
+                                let screen_row = match_line + render_display_offset as i32;
+                                if screen_row >= 0 && (screen_row as usize) < rows {
+                                    let is_current = idx == current_search_match;
+                                    for offset in 0..match_len {
+                                        search_highlights.push((match_col + offset, screen_row as usize, is_current));
+                                    }
+                                }
+                            }
+
                             TerminalPaintData {
                                 cell_width,
                                 cell_height,
@@ -789,6 +935,7 @@ impl Render for TerminalView {
                                 background_color,
                                 cursor_color,
                                 scrollbar,
+                                search_highlights,
                             }
                         }
                     },
@@ -814,6 +961,22 @@ impl Render for TerminalView {
                                 window.paint_quad(fill(
                                     Bounds::new(point(x, y), size(data.cell_width, data.cell_height)),
                                     hsla(0.6, 0.6, 0.5, 0.3),
+                                ));
+                            }
+
+                            // Draw search highlights
+                            for (col, line, is_current) in &data.search_highlights {
+                                let x = origin.x + data.cell_width * *col as f32;
+                                let y = origin.y + data.cell_height * *line as f32;
+                                // Current match is orange, other matches are yellow
+                                let color = if *is_current {
+                                    hsla(0.08, 0.9, 0.5, 0.6) // Orange
+                                } else {
+                                    hsla(0.15, 0.9, 0.5, 0.4) // Yellow
+                                };
+                                window.paint_quad(fill(
+                                    Bounds::new(point(x, y), size(data.cell_width, data.cell_height)),
+                                    color,
                                 ));
                             }
 
@@ -981,7 +1144,14 @@ impl Render for TerminalView {
                     },
                 )
                 .size_full(),
-            )
+            );
+
+        // Add search bar overlay if present
+        if let Some(search_bar) = search_bar_opt {
+            container = container.child(search_bar);
+        }
+
+        container
     }
 }
 

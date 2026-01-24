@@ -69,6 +69,10 @@ pub struct AgentPanel {
     next_message_id: usize,
     awaiting_response: bool,
     thinking_dots: usize,
+    /// Context menu position and message ID (also used for Cmd+C)
+    context_menu: Option<(Point<Pixels>, usize)>,
+    /// Last right-clicked message ID for Cmd+C fallback
+    last_focused_message: Option<usize>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -97,6 +101,8 @@ impl AgentPanel {
             next_message_id: 0,
             awaiting_response: false,
             thinking_dots: 0,
+            context_menu: None,
+            last_focused_message: None,
             _subscriptions: vec![input_sub],
         };
 
@@ -270,17 +276,70 @@ impl AgentPanel {
         }
     }
 
-    /// Parse <cmd>...</cmd> tags from text, returning (start, end, command) tuples
+    /// Strip basic markdown formatting (bold, italic, headers, lists)
+    fn strip_markdown(text: &str) -> String {
+        let mut result = text.to_string();
+
+        // Remove **bold** markers
+        let bold_re = regex_lite::Regex::new(r"\*\*([^*]+)\*\*").unwrap();
+        result = bold_re.replace_all(&result, "$1").to_string();
+
+        // Remove *italic* markers
+        let italic_re = regex_lite::Regex::new(r"\*([^*]+)\*").unwrap();
+        result = italic_re.replace_all(&result, "$1").to_string();
+
+        // Clean up stray list markers "- " at line starts (keep the text)
+        let list_re = regex_lite::Regex::new(r"(?m)^- ").unwrap();
+        result = list_re.replace_all(&result, "• ").to_string();
+
+        result
+    }
+
+    /// Render text with word wrapping using flex layout
+    fn render_wrapped_text(text: &str, color: Rgba) -> Div {
+        let words: Vec<&str> = text.split_whitespace().collect();
+        div()
+            .flex()
+            .flex_wrap()
+            .gap_x(px(4.0))
+            .text_sm()
+            .text_color(color)
+            .children(words.into_iter().map(|word| {
+                div().child(word.to_string())
+            }))
+    }
+
+    /// Parse <cmd>...</cmd> tags and ```bash/sh/shell``` code blocks from text
+    /// Returns (start, end, command) tuples
     fn parse_commands(text: &str) -> Vec<(usize, usize, String)> {
-        let re = regex_lite::Regex::new(r"<cmd>([^<]+)</cmd>").unwrap();
-        re.captures_iter(text)
-            .filter_map(|cap| {
-                let full = cap.get(0)?;
-                let cmd = cap.get(1)?.as_str().trim().to_string();
-                if cmd.is_empty() { return None; }
-                Some((full.start(), full.end(), cmd))
-            })
-            .collect()
+        let mut results = Vec::new();
+
+        // Match <cmd>...</cmd> tags (lazy match for special chars)
+        let cmd_re = regex_lite::Regex::new(r"<cmd>(.*?)</cmd>").unwrap();
+        for cap in cmd_re.captures_iter(text) {
+            if let (Some(full), Some(cmd_match)) = (cap.get(0), cap.get(1)) {
+                let cmd = cmd_match.as_str().trim().to_string();
+                if !cmd.is_empty() {
+                    results.push((full.start(), full.end(), cmd));
+                }
+            }
+        }
+
+        // Match ```bash\n...\n``` or ```sh\n...\n``` or ``` code blocks
+        // Use (?s) for dot-matches-newline, non-greedy match
+        let code_re = regex_lite::Regex::new(r"```(?:bash|sh|shell|zsh)?\s*\n([\s\S]*?)\n?```").unwrap();
+        for cap in code_re.captures_iter(text) {
+            if let (Some(full), Some(code_match)) = (cap.get(0), cap.get(1)) {
+                let cmd = code_match.as_str().trim().to_string();
+                if !cmd.is_empty() {
+                    results.push((full.start(), full.end(), cmd));
+                }
+            }
+        }
+
+        // Sort by position to maintain order
+        results.sort_by_key(|(start, _, _)| *start);
+        results
     }
 
     /// Send command to active terminal (without newline, so user can review before pressing enter)
@@ -291,6 +350,22 @@ impl AgentPanel {
                 let terminal = tab.terminal.lock();
                 terminal.write(command.as_bytes());
             }
+        }
+    }
+
+    /// Copy last focused/right-clicked message to clipboard
+    fn copy_focused_message(&self, cx: &mut App) {
+        let msg_id = self.context_menu.map(|(_, id)| id)
+            .or(self.last_focused_message);
+        if let Some(id) = msg_id {
+            self.copy_message(id, cx);
+        }
+    }
+
+    /// Copy message by ID to clipboard
+    fn copy_message(&self, msg_id: usize, cx: &mut App) {
+        if let Some(msg) = self.messages.iter().find(|m| m.id == msg_id) {
+            cx.write_to_clipboard(ClipboardItem::new_string(msg.content.clone()));
         }
     }
 
@@ -403,16 +478,31 @@ impl Render for AgentPanel {
         let is_connected = self.connection_state == AgentConnectionState::Connected;
         let messages = self.messages.clone();
         let tool_calls = self.pending_tool_calls.clone();
+        let context_menu = self.context_menu;
 
         div()
             .track_focus(&self.focus_handle)
+            .relative()
             .flex()
             .flex_col()
             .h_full()
-            .w(px(360.0))
+            .w_full()
             .bg(rgb(0x1e1e2e))
             .border_l_1()
             .border_color(rgb(0x313244))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                let k = &event.keystroke;
+                if (k.modifiers.platform || k.modifiers.control) && k.key == "c" {
+                    this.copy_focused_message(cx);
+                }
+            }))
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                // Close context menu on click elsewhere
+                if this.context_menu.is_some() {
+                    this.context_menu = None;
+                    cx.notify();
+                }
+            }))
             // Header
             .child(
                 div()
@@ -513,7 +603,8 @@ impl Render for AgentPanel {
                                     MessageRole::Assistant => "Claude",
                                     MessageRole::System => "",
                                 };
-                                let msg_id = ElementId::Name(format!("msg-{}", msg.id).into());
+                                let msg_elem_id = ElementId::Name(format!("msg-{}", msg.id).into());
+                                let msg_numeric_id = msg.id;
 
                                 // Parse commands for assistant messages
                                 let commands = if msg.role == MessageRole::Assistant {
@@ -522,37 +613,44 @@ impl Render for AgentPanel {
                                     Vec::new()
                                 };
 
+                                let content_id = ElementId::Name(format!("content-{}", msg_numeric_id).into());
+                                let content_clone = msg.content.clone();
+                                let label_str = label.to_string();
+                                let has_commands = !commands.is_empty();
+
                                 div()
-                                    .id(msg_id)
+                                    .id(msg_elem_id)
                                     .w_full()
                                     .flex()
                                     .when(right, |e| e.flex_row_reverse())
                                     .child(
                                         div()
-                                            .max_w(px(280.0))
+                                            .id(content_id)
+                                            .w_full()
                                             .bg(bg)
                                             .rounded_md()
                                             .px_3()
                                             .py_2()
-                                            .when(!label.is_empty(), |e| {
+                                            .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                                this.context_menu = Some((event.position, msg_numeric_id));
+                                                this.last_focused_message = Some(msg_numeric_id);
+                                                cx.notify();
+                                            }))
+                                            .when(!label_str.is_empty(), |e| {
                                                 e.child(
                                                     div()
                                                         .text_xs()
                                                         .text_color(rgb(0x6c7086))
                                                         .mb_1()
-                                                        .child(label)
+                                                        .child(label_str.clone())
                                                 )
                                             })
-                                            .when(commands.is_empty(), |e| {
-                                                // No commands - render plain text
-                                                e.child(
-                                                    div()
-                                                        .text_sm()
-                                                        .text_color(tc)
-                                                        .child(msg.content.clone())
-                                                )
+                                            .when(!has_commands, |e| {
+                                                // No commands - render plain text with word wrap
+                                                let stripped = Self::strip_markdown(&content_clone);
+                                                e.child(Self::render_wrapped_text(&stripped, tc))
                                             })
-                                            .when(!commands.is_empty(), |e| {
+                                            .when(has_commands, |e| {
                                                 // Has commands - render text segments with command buttons
                                                 let content = msg.content.clone();
                                                 let mut children: Vec<Div> = Vec::new();
@@ -563,15 +661,15 @@ impl Render for AgentPanel {
                                                     if *start > last_end {
                                                         let text_before = &content[last_end..*start];
                                                         if !text_before.trim().is_empty() {
-                                                            children.push(
-                                                                div().text_sm().text_color(tc).child(text_before.to_string())
-                                                            );
+                                                            let stripped = Self::strip_markdown(text_before);
+                                                            children.push(Self::render_wrapped_text(&stripped, tc));
                                                         }
                                                     }
 
-                                                    // Command block with button
+                                                    // Command block with button (word-wrapped)
                                                     let cmd_clone = cmd.clone();
                                                     let btn_id = ElementId::Name(format!("cmd-btn-{}-{}", msg.id, idx).into());
+                                                    let cmd_words: Vec<&str> = cmd.split_whitespace().collect();
                                                     children.push(
                                                         div()
                                                             .flex()
@@ -585,10 +683,15 @@ impl Render for AgentPanel {
                                                             .child(
                                                                 div()
                                                                     .flex_1()
+                                                                    .flex()
+                                                                    .flex_wrap()
+                                                                    .gap_x(px(4.0))
                                                                     .text_xs()
                                                                     .font_family("monospace")
                                                                     .text_color(rgb(0xa6e3a1))
-                                                                    .child(cmd.clone())
+                                                                    .children(cmd_words.into_iter().map(|word| {
+                                                                        div().child(word.to_string())
+                                                                    }))
                                                             )
                                                             .child(
                                                                 div()
@@ -612,9 +715,8 @@ impl Render for AgentPanel {
                                                 if last_end < content.len() {
                                                     let text_after = &content[last_end..];
                                                     if !text_after.trim().is_empty() {
-                                                        children.push(
-                                                            div().text_sm().text_color(tc).child(text_after.to_string())
-                                                        );
+                                                        let stripped = Self::strip_markdown(text_after);
+                                                        children.push(Self::render_wrapped_text(&stripped, tc));
                                                     }
                                                 }
 
@@ -636,7 +738,7 @@ impl Render for AgentPanel {
                                         .flex()
                                         .child(
                                             div()
-                                                .max_w(px(280.0))
+                                                .w_full()
                                                 .bg(rgb(0x313244))
                                                 .rounded_md()
                                                 .px_3()
@@ -681,6 +783,36 @@ impl Render for AgentPanel {
                         el.child(div().flex_1().text_sm().text_color(rgb(0x6c7086)).child("Connect to chat"))
                     })
             )
+            // Context menu overlay
+            .when_some(context_menu, |el, (pos, msg_id)| {
+                el.child(
+                    div()
+                        .absolute()
+                        .left(pos.x)
+                        .top(pos.y)
+                        .bg(rgb(0x313244))
+                        .border_1()
+                        .border_color(rgb(0x45475a))
+                        .rounded_md()
+                        .shadow_lg()
+                        .child(
+                            div()
+                                .id("copy-menu-item")
+                                .px_3()
+                                .py_2()
+                                .cursor_pointer()
+                                .text_sm()
+                                .text_color(rgb(0xcdd6f4))
+                                .hover(|s| s.bg(rgb(0x45475a)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.copy_message(msg_id, cx);
+                                    this.context_menu = None;
+                                    cx.notify();
+                                }))
+                                .child("Copy")
+                        )
+                )
+            })
     }
 }
 
