@@ -2,12 +2,22 @@
 //!
 //! Wraps the kube crate to provide namespace and pod listing functionality.
 
+use std::collections::HashMap;
+use std::sync::OnceLock;
 use kube::{
     api::{Api, ListParams},
     Client, Config,
 };
 use k8s_openapi::api::core::v1::{Namespace, Pod};
 use thiserror::Error;
+use tokio::sync::RwLock;
+
+/// Global client cache - avoids recreating clients (expensive TLS handshake) for each request
+static CLIENT_CACHE: OnceLock<RwLock<HashMap<String, Client>>> = OnceLock::new();
+
+fn get_client_cache() -> &'static RwLock<HashMap<String, Client>> {
+    CLIENT_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
 
 #[derive(Debug, Error)]
 pub enum KubeClientError {
@@ -53,14 +63,44 @@ impl KubeClient {
         Ok(Self { client, context_name })
     }
 
-    /// Create a client for a specific context
+    /// Create a client for a specific context (cached for performance)
     pub async fn for_context(context_name: &str) -> Result<Self, KubeClientError> {
+        let cache = get_client_cache();
+
+        // Try to get from cache first (fast path)
+        {
+            let read_guard = cache.read().await;
+            if let Some(client) = read_guard.get(context_name) {
+                tracing::debug!("K8s client cache HIT for {}", context_name);
+                return Ok(Self {
+                    client: client.clone(),
+                    context_name: context_name.to_string(),
+                });
+            }
+        }
+
+        tracing::info!("K8s client cache MISS for {} - creating new client", context_name);
+        let start = std::time::Instant::now();
+
+        // Not in cache, create new client
         let options = kube::config::KubeConfigOptions {
             context: Some(context_name.to_string()),
             ..Default::default()
         };
         let config = Config::from_kubeconfig(&options).await?;
+        tracing::debug!("Config loaded in {:?}", start.elapsed());
+
         let client = Client::try_from(config)?;
+        tracing::debug!("Client created in {:?}", start.elapsed());
+
+        // Store in cache
+        {
+            let mut write_guard = cache.write().await;
+            write_guard.insert(context_name.to_string(), client.clone());
+        }
+
+        tracing::info!("K8s client for {} created in {:?}", context_name, start.elapsed());
+
         Ok(Self {
             client,
             context_name: context_name.to_string(),
@@ -79,8 +119,10 @@ impl KubeClient {
 
     /// List all namespaces
     pub async fn list_namespaces(&self) -> Result<Vec<KubeNamespace>, KubeClientError> {
+        let start = std::time::Instant::now();
         let namespaces: Api<Namespace> = Api::all(self.client.clone());
         let list = namespaces.list(&ListParams::default()).await?;
+        tracing::debug!("list_namespaces API call took {:?}", start.elapsed());
 
         Ok(list.items.into_iter().map(|ns| {
             let name = ns.metadata.name.unwrap_or_default();
@@ -93,8 +135,10 @@ impl KubeClient {
 
     /// List pods in a namespace
     pub async fn list_pods(&self, namespace: &str) -> Result<Vec<KubePod>, KubeClientError> {
+        let start = std::time::Instant::now();
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
         let list = pods.list(&ListParams::default()).await?;
+        tracing::debug!("list_pods({}) API call took {:?}", namespace, start.elapsed());
 
         Ok(list.items.into_iter().map(|pod| {
             let name = pod.metadata.name.unwrap_or_default();

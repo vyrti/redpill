@@ -99,7 +99,7 @@ fn main() {
         });
 
         cx.on_action(|_: &About, _cx| {
-            tracing::info!("RedPill - SSH Terminal Manager v{}", env!("CARGO_PKG_VERSION"));
+            tracing::info!("RedPill - SSH / Kube Terminal Manager v{}", env!("CARGO_PKG_VERSION"));
         });
 
         // NewTerminal - open a new local terminal

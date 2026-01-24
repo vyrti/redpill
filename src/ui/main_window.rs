@@ -42,8 +42,8 @@ pub struct MainWindow {
 impl MainWindow {
     pub fn new(cx: &mut Context<Self>) -> Self {
         // Create session tree
-        let session_tree = cx.new(|_| {
-            SessionTree::new()
+        let session_tree = cx.new(|cx| {
+            SessionTree::new(cx)
         });
 
         // Create tabs view with empty tabs
@@ -495,7 +495,7 @@ impl Render for MainWindow {
                         div()
                             .text_xs()
                             .text_color(rgb(0x6c7086))
-                            .child("RedPill - SSH Terminal Manager"),
+                            .child("RedPill - SSH / Kube Terminal Manager"),
                     )
                     .child(
                         div()

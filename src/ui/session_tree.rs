@@ -1,7 +1,6 @@
 use gpui::*;
 use gpui::prelude::*;
 use std::collections::{HashMap, HashSet};
-use std::sync::mpsc;
 use uuid::Uuid;
 
 use crate::app::AppState;
@@ -147,21 +146,36 @@ pub struct SessionTree {
     loading_contexts: HashSet<String>,
     /// Namespaces currently loading pods (key: "context:namespace")
     loading_namespaces: HashSet<String>,
-    /// Channel receiver for K8s data updates
-    k8s_update_rx: mpsc::Receiver<K8sUpdate>,
     /// Channel sender for K8s data updates (cloned for async tasks)
-    k8s_update_tx: mpsc::Sender<K8sUpdate>,
+    k8s_update_tx: async_channel::Sender<K8sUpdate>,
 }
 
 impl SessionTree {
-    pub fn new() -> Self {
+    pub fn new(cx: &mut Context<Self>) -> Self {
         // Try to load kubeconfig
         let kube_config = KubeConfig::load_default().ok();
         if let Some(ref config) = kube_config {
             tracing::info!("Loaded kubeconfig with {} contexts", config.contexts.len());
         }
 
-        let (k8s_update_tx, k8s_update_rx) = mpsc::channel();
+        let (k8s_update_tx, k8s_update_rx) = async_channel::unbounded();
+
+        // Spawn async task to listen for K8s updates and notify UI immediately
+        cx.spawn({
+            let rx = k8s_update_rx;
+            async move |this: WeakEntity<SessionTree>, cx: &mut AsyncApp| {
+                while let Ok(update) = rx.recv().await {
+                    if let Some(entity) = this.upgrade() {
+                        let _ = cx.update_entity(&entity, |tree: &mut SessionTree, cx: &mut Context<SessionTree>| {
+                            tree.handle_k8s_update(update);
+                            cx.notify();
+                        });
+                    } else {
+                        break; // Entity was dropped, stop the loop
+                    }
+                }
+            }
+        }).detach();
 
         Self {
             state: SessionTreeState::new(),
@@ -180,8 +194,35 @@ impl SessionTree {
             expanded_k8s_namespaces: HashSet::new(),
             loading_contexts: HashSet::new(),
             loading_namespaces: HashSet::new(),
-            k8s_update_rx,
             k8s_update_tx,
+        }
+    }
+
+    /// Handle a K8s update from the async channel
+    fn handle_k8s_update(&mut self, update: K8sUpdate) {
+        match update {
+            K8sUpdate::Namespaces { context, namespaces } => {
+                tracing::info!("Loaded {} namespaces for context {}", namespaces.len(), context);
+                self.loading_contexts.remove(&context);
+                self.k8s_namespaces.insert(context, namespaces);
+            }
+            K8sUpdate::NamespacesError { context, error } => {
+                tracing::warn!("Failed to load namespaces for {}: {}", context, error);
+                self.loading_contexts.remove(&context);
+                self.k8s_namespaces.insert(context, vec![]);
+            }
+            K8sUpdate::Pods { context, namespace, pods } => {
+                tracing::info!("Loaded {} pods for {}:{}", pods.len(), context, namespace);
+                let key = format!("{}:{}", context, namespace);
+                self.loading_namespaces.remove(&key);
+                self.k8s_pods.insert(key, pods);
+            }
+            K8sUpdate::PodsError { context, namespace, error } => {
+                tracing::warn!("Failed to load pods for {}:{}: {}", context, namespace, error);
+                let key = format!("{}:{}", context, namespace);
+                self.loading_namespaces.remove(&key);
+                self.k8s_pods.insert(key, vec![]);
+            }
         }
     }
 
@@ -233,13 +274,13 @@ impl SessionTree {
                                 let _ = tx.send(K8sUpdate::Namespaces {
                                     context: ctx_name,
                                     namespaces
-                                });
+                                }).await;
                             }
                             Err(e) => {
                                 let _ = tx.send(K8sUpdate::NamespacesError {
                                     context: ctx_name,
                                     error: e.to_string()
-                                });
+                                }).await;
                             }
                         }
                     }
@@ -247,7 +288,7 @@ impl SessionTree {
                         let _ = tx.send(K8sUpdate::NamespacesError {
                             context: ctx_name,
                             error: e.to_string()
-                        });
+                        }).await;
                     }
                 }
             });
@@ -273,14 +314,14 @@ impl SessionTree {
                                     context: ctx_name,
                                     namespace: ns,
                                     pods
-                                });
+                                }).await;
                             }
                             Err(e) => {
                                 let _ = tx.send(K8sUpdate::PodsError {
                                     context: ctx_name,
                                     namespace: ns,
                                     error: e.to_string()
-                                });
+                                }).await;
                             }
                         }
                     }
@@ -289,46 +330,11 @@ impl SessionTree {
                             context: ctx_name,
                             namespace: ns,
                             error: e.to_string()
-                        });
+                        }).await;
                     }
                 }
             });
         }
-    }
-
-    /// Process K8s updates from the channel
-    fn process_k8s_updates(&mut self) -> bool {
-        let mut had_updates = false;
-        while let Ok(update) = self.k8s_update_rx.try_recv() {
-            had_updates = true;
-            match update {
-                K8sUpdate::Namespaces { context, namespaces } => {
-                    tracing::info!("Loaded {} namespaces for context {}", namespaces.len(), context);
-                    self.loading_contexts.remove(&context);
-                    self.k8s_namespaces.insert(context, namespaces);
-                }
-                K8sUpdate::NamespacesError { context, error } => {
-                    tracing::warn!("Failed to load namespaces for {}: {}", context, error);
-                    self.loading_contexts.remove(&context);
-                    // Insert empty to prevent retrying
-                    self.k8s_namespaces.insert(context, vec![]);
-                }
-                K8sUpdate::Pods { context, namespace, pods } => {
-                    let key = format!("{}:{}", context, namespace);
-                    tracing::info!("Loaded {} pods for {}", pods.len(), key);
-                    self.loading_namespaces.remove(&key);
-                    self.k8s_pods.insert(key, pods);
-                }
-                K8sUpdate::PodsError { context, namespace, error } => {
-                    let key = format!("{}:{}", context, namespace);
-                    tracing::warn!("Failed to load pods for {}: {}", key, error);
-                    self.loading_namespaces.remove(&key);
-                    // Insert empty to prevent retrying
-                    self.k8s_pods.insert(key, vec![]);
-                }
-            }
-        }
-        had_updates
     }
 
     /// Handle clicking on a pod to exec into it
@@ -1117,11 +1123,6 @@ impl SessionTree {
 
 impl Render for SessionTree {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Process K8s updates from async tasks
-        if self.process_k8s_updates() {
-            cx.notify();
-        }
-
         // Handle pending dialog requests
         if let Some(group_id) = self.pending_new_session_group.take() {
             let group_id = if group_id.is_nil() { None } else { Some(group_id) };
@@ -1371,5 +1372,5 @@ impl Render for SessionTree {
 
 /// Create a session tree view
 pub fn session_tree(cx: &mut App) -> Entity<SessionTree> {
-    cx.new(|_| SessionTree::new())
+    cx.new(|cx| SessionTree::new(cx))
 }
