@@ -645,107 +645,103 @@ impl Render for TerminalView {
                             let mut render_history_size: usize = 0;
 
                             terminal.with_term(|term| {
-                                // Use renderable_content() to properly handle scrollback
-                                let content = term.renderable_content();
-                                let display_offset = content.display_offset as i32;
-                                render_display_offset = content.display_offset;
-                                render_history_size = term.history_size();
+                                // Use grid() directly for correct rendering
+                                // This matches the working version (commit 1d8bcdd)
+                                let content = term.grid();
                                 let screen_lines = term.screen_lines();
+                                let columns = term.columns();
 
-                                let mut current_run: Option<PositionedTextRun> = None;
-                                let mut last_line: Option<i32> = None;
+                                // Get selection range using term.selection (not renderable_content)
+                                let selection_range = term.selection.as_ref().and_then(|s| s.to_range(term));
 
-                                for indexed in content.display_iter {
-                                    let pt = indexed.point;
-                                    let cell = indexed.cell;
+                                // For scrollbar only - don't use for grid access
+                                render_display_offset = content.display_offset();
+                                render_history_size = term.history_size();
 
-                                    // Convert grid line to screen row (0-indexed from top)
-                                    let screen_row = (pt.line.0 + display_offset) as usize;
-                                    let col_idx = pt.column.0;
+                                // Iterate in strict left-to-right, top-to-bottom order
+                                for line_idx in 0..screen_lines {
+                                    // Direct line indexing - NO display_offset adjustment
+                                    let line = Line(line_idx as i32);
+                                    let mut current_run: Option<PositionedTextRun> = None;
 
-                                    // Skip cells outside visible area
-                                    if screen_row >= screen_lines {
-                                        continue;
-                                    }
+                                    for col_idx in 0..columns {
+                                        let col = Column(col_idx);
+                                        let pt = TermPoint::new(line, col);
+                                        let cell = &content[pt];
 
-                                    // Flush current run when moving to new line
-                                    if last_line != Some(pt.line.0) {
-                                        if let Some(run) = current_run.take() {
-                                            text_runs.push(run);
+                                        let screen_row = line_idx;
+
+                                        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                                            continue;
                                         }
-                                        last_line = Some(pt.line.0);
-                                    }
 
-                                    if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                                        continue;
-                                    }
-
-                                    // Check selection using alacritty's built-in
-                                    if let Some(ref range) = content.selection {
-                                        if range.contains(pt) {
-                                            selected_cells.push((col_idx, screen_row));
+                                        // Check selection using selection_range
+                                        if let Some(ref range) = selection_range {
+                                            if range.contains(pt) {
+                                                selected_cells.push((col_idx, screen_row));
+                                            }
                                         }
-                                    }
 
-                                    // Handle INVERSE flag (reverse video) - swap fg and bg
-                                    let is_inverse = cell.flags.contains(Flags::INVERSE);
-                                    let (cell_fg, cell_bg) = if is_inverse {
-                                        (cell.bg, cell.fg)
-                                    } else {
-                                        (cell.fg, cell.bg)
-                                    };
-
-                                    // Background color
-                                    if cell_bg != Color::Named(NamedColor::Background) || is_inverse {
-                                        let bg_color = if is_inverse && cell_bg == Color::Named(NamedColor::Foreground) {
-                                            // Default foreground as background in inverse mode
-                                            color_to_hsla(Color::Named(NamedColor::Foreground), &colors, &scheme)
-                                        } else if is_inverse && cell.fg == Color::Named(NamedColor::Foreground) {
-                                            // Use default foreground color for inverse
-                                            color_to_hsla(Color::Named(NamedColor::Foreground), &colors, &scheme)
+                                        // Handle INVERSE flag (reverse video) - swap fg and bg
+                                        let is_inverse = cell.flags.contains(Flags::INVERSE);
+                                        let (cell_fg, cell_bg) = if is_inverse {
+                                            (cell.bg, cell.fg)
                                         } else {
-                                            color_to_hsla(cell_bg, &colors, &scheme)
+                                            (cell.fg, cell.bg)
                                         };
-                                        bg_rects.push((col_idx, screen_row, bg_color));
-                                    }
 
-                                    let c = cell.c;
-                                    if c == ' ' || c == '\0' {
-                                        if let Some(run) = current_run.take() {
-                                            text_runs.push(run);
+                                        // Background color
+                                        if cell_bg != Color::Named(NamedColor::Background) || is_inverse {
+                                            let bg_color = if is_inverse && cell_bg == Color::Named(NamedColor::Foreground) {
+                                                // Default foreground as background in inverse mode
+                                                color_to_hsla(Color::Named(NamedColor::Foreground), &colors, &scheme)
+                                            } else if is_inverse && cell.fg == Color::Named(NamedColor::Foreground) {
+                                                // Use default foreground color for inverse
+                                                color_to_hsla(Color::Named(NamedColor::Foreground), &colors, &scheme)
+                                            } else {
+                                                color_to_hsla(cell_bg, &colors, &scheme)
+                                            };
+                                            bg_rects.push((col_idx, screen_row, bg_color));
                                         }
-                                        // Still need to draw background for spaces in inverse mode
-                                        continue;
-                                    }
 
-                                    let fg_color = color_to_hsla(cell_fg, &colors, &scheme);
-                                    let bold = cell.flags.contains(Flags::BOLD);
-
-                                    let can_extend = current_run.as_ref().map_or(false, |run| {
-                                        run.line == screen_row
-                                            && run.col + run.text.chars().count() == col_idx
-                                            && run.fg_color == fg_color
-                                            && run.bold == bold
-                                    });
-
-                                    if can_extend {
-                                        current_run.as_mut().unwrap().text.push(c);
-                                    } else {
-                                        if let Some(run) = current_run.take() {
-                                            text_runs.push(run);
+                                        let c = cell.c;
+                                        if c == ' ' || c == '\0' {
+                                            if let Some(run) = current_run.take() {
+                                                text_runs.push(run);
+                                            }
+                                            continue;
                                         }
-                                        current_run = Some(PositionedTextRun {
-                                            col: col_idx,
-                                            line: screen_row,
-                                            text: c.to_string(),
-                                            fg_color,
-                                            bold,
+
+                                        let fg_color = color_to_hsla(cell_fg, &colors, &scheme);
+                                        let bold = cell.flags.contains(Flags::BOLD);
+
+                                        let can_extend = current_run.as_ref().map_or(false, |run| {
+                                            run.line == screen_row
+                                                && run.col + run.text.chars().count() == col_idx
+                                                && run.fg_color == fg_color
+                                                && run.bold == bold
                                         });
-                                    }
-                                }
 
-                                if let Some(run) = current_run.take() {
-                                    text_runs.push(run);
+                                        if can_extend {
+                                            current_run.as_mut().unwrap().text.push(c);
+                                        } else {
+                                            if let Some(run) = current_run.take() {
+                                                text_runs.push(run);
+                                            }
+                                            current_run = Some(PositionedTextRun {
+                                                col: col_idx,
+                                                line: screen_row,
+                                                text: c.to_string(),
+                                                fg_color,
+                                                bold,
+                                            });
+                                        }
+                                    }
+
+                                    // Flush run at end of line
+                                    if let Some(run) = current_run.take() {
+                                        text_runs.push(run);
+                                    }
                                 }
                             });
 
@@ -1002,15 +998,15 @@ pub fn terminal_view(terminal: Arc<Mutex<Terminal>>, color_scheme: Option<String
 fn default_terminal_font() -> &'static str {
     #[cfg(target_os = "windows")]
     {
-        "Cascadia Code"
+        "Consolas"
     }
     #[cfg(target_os = "macos")]
     {
-        "SF Mono"
+        "Monaco"
     }
     #[cfg(target_os = "linux")]
     {
-        "JetBrains Mono"
+        "DejaVu Sans Mono"
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
