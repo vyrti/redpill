@@ -7,10 +7,12 @@ use std::sync::OnceLock;
 use kube::{
     api::{Api, ListParams},
     Client, Config,
+    runtime::watcher::{self, Event as WatchEvent},
 };
 use k8s_openapi::api::core::v1::{Namespace, Pod};
 use thiserror::Error;
 use tokio::sync::RwLock;
+use futures::StreamExt;
 
 /// Global client cache - avoids recreating clients (expensive TLS handshake) for each request
 static CLIENT_CACHE: OnceLock<RwLock<HashMap<String, Client>>> = OnceLock::new();
@@ -208,4 +210,134 @@ impl KubeClient {
             containers,
         })
     }
+
+    /// Watch namespaces for changes and send updates via the channel
+    pub async fn watch_namespaces<F>(&self, mut on_event: F) -> Result<(), KubeClientError>
+    where
+        F: FnMut(NamespaceWatchEvent) + Send,
+    {
+        let namespaces: Api<Namespace> = Api::all(self.client.clone());
+        let watcher_config = watcher::Config::default();
+        let mut stream = watcher::watcher(namespaces, watcher_config).boxed();
+
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(WatchEvent::Apply(ns)) => {
+                    let name = ns.metadata.name.unwrap_or_default();
+                    let status = ns.status
+                        .and_then(|s| s.phase)
+                        .unwrap_or_else(|| "Unknown".to_string());
+                    on_event(NamespaceWatchEvent::Added(KubeNamespace { name, status }));
+                }
+                Ok(WatchEvent::Delete(ns)) => {
+                    let name = ns.metadata.name.unwrap_or_default();
+                    on_event(NamespaceWatchEvent::Deleted(name));
+                }
+                Ok(WatchEvent::Init) => {
+                    // Initial list started
+                }
+                Ok(WatchEvent::InitApply(ns)) => {
+                    // Initial list item
+                    let name = ns.metadata.name.unwrap_or_default();
+                    let status = ns.status
+                        .and_then(|s| s.phase)
+                        .unwrap_or_else(|| "Unknown".to_string());
+                    on_event(NamespaceWatchEvent::Added(KubeNamespace { name, status }));
+                }
+                Ok(WatchEvent::InitDone) => {
+                    // Initial list complete
+                    on_event(NamespaceWatchEvent::InitDone);
+                }
+                Err(e) => {
+                    tracing::warn!("Namespace watch error: {}", e);
+                    // Continue watching after transient errors
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Watch pods in a namespace for changes
+    pub async fn watch_pods<F>(&self, namespace: &str, mut on_event: F) -> Result<(), KubeClientError>
+    where
+        F: FnMut(PodWatchEvent) + Send,
+    {
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
+        let watcher_config = watcher::Config::default();
+        let mut stream = watcher::watcher(pods, watcher_config).boxed();
+
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(WatchEvent::Apply(pod)) | Ok(WatchEvent::InitApply(pod)) => {
+                    let kube_pod = Self::convert_pod(pod);
+                    on_event(PodWatchEvent::AddedOrModified(kube_pod));
+                }
+                Ok(WatchEvent::Delete(pod)) => {
+                    let name = pod.metadata.name.unwrap_or_default();
+                    on_event(PodWatchEvent::Deleted(name));
+                }
+                Ok(WatchEvent::Init) => {
+                    // Initial list started
+                }
+                Ok(WatchEvent::InitDone) => {
+                    on_event(PodWatchEvent::InitDone);
+                }
+                Err(e) => {
+                    tracing::warn!("Pod watch error: {}", e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Convert a k8s Pod to our KubePod type
+    fn convert_pod(pod: Pod) -> KubePod {
+        let name = pod.metadata.name.unwrap_or_default();
+        let namespace = pod.metadata.namespace.unwrap_or_default();
+
+        let (status, ready, containers) = if let Some(status) = pod.status {
+            let phase = status.phase.unwrap_or_else(|| "Unknown".to_string());
+
+            let container_statuses = status.container_statuses.unwrap_or_default();
+            let total = container_statuses.len();
+            let ready_count = container_statuses.iter()
+                .filter(|c| c.ready)
+                .count();
+            let ready_str = format!("{}/{}", ready_count, total);
+
+            let container_names: Vec<String> = container_statuses.iter()
+                .map(|c| c.name.clone())
+                .collect();
+
+            (phase, ready_str, container_names)
+        } else {
+            ("Unknown".to_string(), "0/0".to_string(), vec![])
+        };
+
+        KubePod {
+            name,
+            namespace,
+            status,
+            ready,
+            containers,
+        }
+    }
+}
+
+/// Event from namespace watcher
+#[derive(Debug, Clone)]
+pub enum NamespaceWatchEvent {
+    Added(KubeNamespace),
+    Deleted(String),
+    InitDone,
+}
+
+/// Event from pod watcher
+#[derive(Debug, Clone)]
+pub enum PodWatchEvent {
+    AddedOrModified(KubePod),
+    Deleted(String),
+    InitDone,
 }

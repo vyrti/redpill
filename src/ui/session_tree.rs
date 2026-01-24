@@ -4,8 +4,7 @@ use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use crate::app::AppState;
-use crate::kubernetes::{KubeConfig, KubeContext, KubeClient};
-use crate::kubernetes::client::{KubeNamespace, KubePod};
+use crate::kubernetes::{KubeConfig, KubeContext, KubeClient, KubeNamespace, KubePod, NamespaceWatchEvent, PodWatchEvent};
 use crate::session::{Session, SessionGroup, SshSession, SsmSession};
 use super::session_dialog::SessionDialog;
 use super::group_dialog::GroupDialog;
@@ -118,6 +117,11 @@ pub enum K8sUpdate {
     NamespacesError { context: String, error: String },
     Pods { context: String, namespace: String, pods: Vec<KubePod> },
     PodsError { context: String, namespace: String, error: String },
+    // Watch events for real-time updates
+    NamespaceAdded { context: String, namespace: KubeNamespace },
+    NamespaceDeleted { context: String, name: String },
+    PodAddedOrModified { context: String, namespace: String, pod: KubePod },
+    PodDeleted { context: String, namespace: String, name: String },
 }
 
 /// Session tree panel component
@@ -148,6 +152,10 @@ pub struct SessionTree {
     loading_namespaces: HashSet<String>,
     /// Channel sender for K8s data updates (cloned for async tasks)
     k8s_update_tx: async_channel::Sender<K8sUpdate>,
+    /// Active namespace watchers per context (for cleanup)
+    active_namespace_watchers: HashSet<String>,
+    /// Active pod watchers per context:namespace (for cleanup)
+    active_pod_watchers: HashSet<String>,
 }
 
 impl SessionTree {
@@ -195,6 +203,8 @@ impl SessionTree {
             loading_contexts: HashSet::new(),
             loading_namespaces: HashSet::new(),
             k8s_update_tx,
+            active_namespace_watchers: HashSet::new(),
+            active_pod_watchers: HashSet::new(),
         }
     }
 
@@ -202,9 +212,17 @@ impl SessionTree {
     fn handle_k8s_update(&mut self, update: K8sUpdate) {
         match update {
             K8sUpdate::Namespaces { context, namespaces } => {
-                tracing::info!("Loaded {} namespaces for context {}", namespaces.len(), context);
-                self.loading_contexts.remove(&context);
-                self.k8s_namespaces.insert(context, namespaces);
+                // This is now just a marker that initial load is complete (namespaces vec is empty)
+                // Real data comes through NamespaceAdded events
+                if namespaces.is_empty() {
+                    tracing::debug!("Namespace watcher init complete for {}", context);
+                    self.loading_contexts.remove(&context);
+                } else {
+                    // Fallback for non-watcher path (shouldn't happen normally)
+                    tracing::info!("Loaded {} namespaces for context {}", namespaces.len(), context);
+                    self.loading_contexts.remove(&context);
+                    self.k8s_namespaces.insert(context, namespaces);
+                }
             }
             K8sUpdate::NamespacesError { context, error } => {
                 tracing::warn!("Failed to load namespaces for {}: {}", context, error);
@@ -212,16 +230,65 @@ impl SessionTree {
                 self.k8s_namespaces.insert(context, vec![]);
             }
             K8sUpdate::Pods { context, namespace, pods } => {
-                tracing::info!("Loaded {} pods for {}:{}", pods.len(), context, namespace);
+                // This is now just a marker that initial load is complete (pods vec is empty)
+                // Real data comes through PodAddedOrModified events
                 let key = format!("{}:{}", context, namespace);
-                self.loading_namespaces.remove(&key);
-                self.k8s_pods.insert(key, pods);
+                if pods.is_empty() {
+                    tracing::debug!("Pod watcher init complete for {}:{}", context, namespace);
+                    self.loading_namespaces.remove(&key);
+                } else {
+                    // Fallback for non-watcher path (shouldn't happen normally)
+                    tracing::info!("Loaded {} pods for {}:{}", pods.len(), context, namespace);
+                    self.loading_namespaces.remove(&key);
+                    self.k8s_pods.insert(key, pods);
+                }
             }
             K8sUpdate::PodsError { context, namespace, error } => {
                 tracing::warn!("Failed to load pods for {}:{}: {}", context, namespace, error);
                 let key = format!("{}:{}", context, namespace);
                 self.loading_namespaces.remove(&key);
                 self.k8s_pods.insert(key, vec![]);
+            }
+            // Watch events for real-time updates
+            K8sUpdate::NamespaceAdded { context, namespace } => {
+                tracing::debug!("Namespace added/modified: {}:{}", context, namespace.name);
+                if let Some(namespaces) = self.k8s_namespaces.get_mut(&context) {
+                    // Update existing or add new
+                    if let Some(existing) = namespaces.iter_mut().find(|n| n.name == namespace.name) {
+                        existing.status = namespace.status;
+                    } else {
+                        namespaces.push(namespace);
+                        // Keep sorted by name
+                        namespaces.sort_by(|a, b| a.name.cmp(&b.name));
+                    }
+                }
+            }
+            K8sUpdate::NamespaceDeleted { context, name } => {
+                tracing::debug!("Namespace deleted: {}:{}", context, name);
+                if let Some(namespaces) = self.k8s_namespaces.get_mut(&context) {
+                    namespaces.retain(|n| n.name != name);
+                }
+            }
+            K8sUpdate::PodAddedOrModified { context, namespace, pod } => {
+                tracing::debug!("Pod added/modified: {}:{}:{}", context, namespace, pod.name);
+                let key = format!("{}:{}", context, namespace);
+                if let Some(pods) = self.k8s_pods.get_mut(&key) {
+                    // Update existing or add new
+                    if let Some(existing) = pods.iter_mut().find(|p| p.name == pod.name) {
+                        *existing = pod;
+                    } else {
+                        pods.push(pod);
+                        // Keep sorted by name
+                        pods.sort_by(|a, b| a.name.cmp(&b.name));
+                    }
+                }
+            }
+            K8sUpdate::PodDeleted { context, namespace, name } => {
+                tracing::debug!("Pod deleted: {}:{}:{}", context, namespace, name);
+                let key = format!("{}:{}", context, namespace);
+                if let Some(pods) = self.k8s_pods.get_mut(&key) {
+                    pods.retain(|p| p.name != name);
+                }
             }
         }
     }
@@ -258,9 +325,17 @@ impl SessionTree {
         }
     }
 
-    /// Load namespaces for a K8s context
+    /// Load namespaces for a K8s context (starts a watcher for real-time updates)
     fn load_namespaces(&mut self, context_name: String, cx: &mut Context<Self>) {
+        // Don't start duplicate watchers
+        if self.active_namespace_watchers.contains(&context_name) {
+            return;
+        }
+
         self.loading_contexts.insert(context_name.clone());
+        self.active_namespace_watchers.insert(context_name.clone());
+        // Initialize empty list (will be populated by watcher)
+        self.k8s_namespaces.insert(context_name.clone(), Vec::new());
         let tx = self.k8s_update_tx.clone();
 
         if let Some(app_state) = cx.try_global::<AppState>() {
@@ -269,25 +344,45 @@ impl SessionTree {
             runtime.spawn(async move {
                 match KubeClient::for_context(&ctx_name).await {
                     Ok(client) => {
-                        match client.list_namespaces().await {
-                            Ok(namespaces) => {
-                                let _ = tx.send(K8sUpdate::Namespaces {
-                                    context: ctx_name,
-                                    namespaces
-                                }).await;
+                        let ctx_for_watch = ctx_name.clone();
+                        let tx_for_watch = tx.clone();
+
+                        if let Err(e) = client.watch_namespaces(move |event| {
+                            let ctx = ctx_for_watch.clone();
+                            let tx = tx_for_watch.clone();
+
+                            match event {
+                                NamespaceWatchEvent::Added(namespace) => {
+                                    let _ = tx.send_blocking(K8sUpdate::NamespaceAdded {
+                                        context: ctx,
+                                        namespace,
+                                    });
+                                }
+                                NamespaceWatchEvent::Deleted(name) => {
+                                    let _ = tx.send_blocking(K8sUpdate::NamespaceDeleted {
+                                        context: ctx,
+                                        name,
+                                    });
+                                }
+                                NamespaceWatchEvent::InitDone => {
+                                    // Signal that initial load is complete
+                                    let _ = tx.send_blocking(K8sUpdate::Namespaces {
+                                        context: ctx,
+                                        namespaces: vec![], // Marker that init is done
+                                    });
+                                }
                             }
-                            Err(e) => {
-                                let _ = tx.send(K8sUpdate::NamespacesError {
-                                    context: ctx_name,
-                                    error: e.to_string()
-                                }).await;
-                            }
+                        }).await {
+                            let _ = tx.send(K8sUpdate::NamespacesError {
+                                context: ctx_name,
+                                error: e.to_string(),
+                            }).await;
                         }
                     }
                     Err(e) => {
                         let _ = tx.send(K8sUpdate::NamespacesError {
                             context: ctx_name,
-                            error: e.to_string()
+                            error: e.to_string(),
                         }).await;
                     }
                 }
@@ -295,10 +390,19 @@ impl SessionTree {
         }
     }
 
-    /// Load pods for a K8s namespace
+    /// Load pods for a K8s namespace (starts a watcher for real-time updates)
     fn load_pods(&mut self, context_name: String, namespace: String, cx: &mut Context<Self>) {
         let key = format!("{}:{}", context_name, namespace);
-        self.loading_namespaces.insert(key);
+
+        // Don't start duplicate watchers
+        if self.active_pod_watchers.contains(&key) {
+            return;
+        }
+
+        self.loading_namespaces.insert(key.clone());
+        self.active_pod_watchers.insert(key.clone());
+        // Initialize empty list (will be populated by watcher)
+        self.k8s_pods.insert(key, Vec::new());
         let tx = self.k8s_update_tx.clone();
 
         if let Some(app_state) = cx.try_global::<AppState>() {
@@ -308,28 +412,52 @@ impl SessionTree {
             runtime.spawn(async move {
                 match KubeClient::for_context(&ctx_name).await {
                     Ok(client) => {
-                        match client.list_pods(&ns).await {
-                            Ok(pods) => {
-                                let _ = tx.send(K8sUpdate::Pods {
-                                    context: ctx_name,
-                                    namespace: ns,
-                                    pods
-                                }).await;
+                        let ctx_for_watch = ctx_name.clone();
+                        let ns_for_watch = ns.clone();
+                        let tx_for_watch = tx.clone();
+
+                        if let Err(e) = client.watch_pods(&ns, move |event| {
+                            let ctx = ctx_for_watch.clone();
+                            let namespace = ns_for_watch.clone();
+                            let tx = tx_for_watch.clone();
+
+                            match event {
+                                PodWatchEvent::AddedOrModified(pod) => {
+                                    let _ = tx.send_blocking(K8sUpdate::PodAddedOrModified {
+                                        context: ctx,
+                                        namespace,
+                                        pod,
+                                    });
+                                }
+                                PodWatchEvent::Deleted(name) => {
+                                    let _ = tx.send_blocking(K8sUpdate::PodDeleted {
+                                        context: ctx,
+                                        namespace,
+                                        name,
+                                    });
+                                }
+                                PodWatchEvent::InitDone => {
+                                    // Signal that initial load is complete
+                                    let _ = tx.send_blocking(K8sUpdate::Pods {
+                                        context: ctx,
+                                        namespace,
+                                        pods: vec![], // Marker that init is done
+                                    });
+                                }
                             }
-                            Err(e) => {
-                                let _ = tx.send(K8sUpdate::PodsError {
-                                    context: ctx_name,
-                                    namespace: ns,
-                                    error: e.to_string()
-                                }).await;
-                            }
+                        }).await {
+                            let _ = tx.send(K8sUpdate::PodsError {
+                                context: ctx_name,
+                                namespace: ns,
+                                error: e.to_string(),
+                            }).await;
                         }
                     }
                     Err(e) => {
                         let _ = tx.send(K8sUpdate::PodsError {
                             context: ctx_name,
                             namespace: ns,
-                            error: e.to_string()
+                            error: e.to_string(),
                         }).await;
                     }
                 }
