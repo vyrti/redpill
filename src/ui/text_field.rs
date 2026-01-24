@@ -189,7 +189,6 @@ impl Render for TextField {
 
                 match keystroke.key.as_str() {
                     "enter" if !keystroke.modifiers.shift => {
-                        tracing::info!("TextField: Enter pressed, emitting Submit");
                         cx.emit(TextFieldEvent::Submit);
                     }
                     "backspace" => this.handle_backspace(cx),

@@ -34,6 +34,18 @@ pub enum AgentConnectionState {
     Error(String),
 }
 
+/// Permission mode for Claude CLI
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub enum PermissionMode {
+    /// Default mode - asks for permission
+    #[default]
+    Default,
+    /// Bypass all permission prompts
+    BypassPermissions,
+    /// Plan mode - requires approval before executing
+    PlanMode,
+}
+
 pub enum AgentPanelEvent {
     MessageReceived(String),
     ToggleVisibility,
@@ -45,6 +57,7 @@ pub struct AgentPanel {
     connection: Option<Arc<ClaudeConnection>>,
     session_info: Option<SessionInfo>,
     connection_state: AgentConnectionState,
+    permission_mode: PermissionMode,
     messages: Vec<AgentMessage>,
     pending_tool_calls: Vec<ToolCall>,
     input_field: Entity<TextField>,
@@ -61,9 +74,7 @@ impl AgentPanel {
         let input_field = cx.new(|cx| TextField::new(cx, ""));
 
         let input_sub = cx.subscribe(&input_field, |this, _field, event, cx| {
-            tracing::info!("AgentPanel: TextField event received: {:?}", std::mem::discriminant(event));
             if let TextFieldEvent::Submit = event {
-                tracing::info!("AgentPanel: Submit event, calling send_message");
                 this.send_message(cx);
             }
         });
@@ -72,6 +83,7 @@ impl AgentPanel {
             connection: None,
             session_info: None,
             connection_state: AgentConnectionState::Disconnected,
+            permission_mode: PermissionMode::BypassPermissions, // Default to bypass for convenience
             messages: Vec::new(),
             pending_tool_calls: Vec::new(),
             input_field,
@@ -90,9 +102,7 @@ impl AgentPanel {
     fn add_message(&mut self, role: MessageRole, content: String) {
         let id = self.next_message_id;
         self.next_message_id += 1;
-        tracing::info!("AgentPanel: adding message id={} role={:?} content={:?}", id, role, content);
         self.messages.push(AgentMessage { id, role, content });
-        tracing::info!("AgentPanel: total messages now: {}", self.messages.len());
     }
 
     fn scroll_to_bottom(&mut self, cx: &mut Context<Self>) {
@@ -126,7 +136,14 @@ impl AgentPanel {
 
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-        match ClaudeConnection::connect(&cwd) {
+        // Build args based on permission mode
+        let extra_args: Vec<&str> = match self.permission_mode {
+            PermissionMode::Default => vec![],
+            PermissionMode::BypassPermissions => vec!["--dangerously-skip-permissions"],
+            PermissionMode::PlanMode => vec!["--plan"],
+        };
+
+        match ClaudeConnection::connect_with_args(&cwd, &extra_args) {
             Ok((conn, update_rx)) => {
                 self.connection = Some(Arc::new(conn));
                 self.update_rx = Some(update_rx);
@@ -139,6 +156,27 @@ impl AgentPanel {
                 self.add_message(MessageRole::System, format!("Failed: {}", e));
                 cx.notify();
             }
+        }
+    }
+
+    fn cycle_permission_mode(&mut self, cx: &mut Context<Self>) {
+        // Only allow changing mode when disconnected
+        if self.connection_state != AgentConnectionState::Disconnected {
+            return;
+        }
+        self.permission_mode = match self.permission_mode {
+            PermissionMode::Default => PermissionMode::BypassPermissions,
+            PermissionMode::BypassPermissions => PermissionMode::PlanMode,
+            PermissionMode::PlanMode => PermissionMode::Default,
+        };
+        cx.notify();
+    }
+
+    fn permission_mode_label(&self) -> &'static str {
+        match self.permission_mode {
+            PermissionMode::Default => "Default",
+            PermissionMode::BypassPermissions => "Bypass",
+            PermissionMode::PlanMode => "Plan",
         }
     }
 
@@ -156,9 +194,7 @@ impl AgentPanel {
 
     fn send_message(&mut self, cx: &mut Context<Self>) {
         let content = self.input_field.read(cx).content().trim().to_string();
-        tracing::info!("AgentPanel: send_message called, content={:?}", content);
         if content.is_empty() {
-            tracing::info!("AgentPanel: content is empty, returning");
             return;
         }
 
@@ -288,7 +324,6 @@ impl Render for AgentPanel {
         let is_connected = self.connection_state == AgentConnectionState::Connected;
         let messages = self.messages.clone();
         let tool_calls = self.pending_tool_calls.clone();
-        tracing::debug!("AgentPanel: render called, messages.len()={}, is_connected={}", messages.len(), is_connected);
 
         div()
             .track_focus(&self.focus_handle)
@@ -318,7 +353,7 @@ impl Render for AgentPanel {
                                     .on_click(cx.listener(|_, _, _, cx| cx.emit(AgentPanelEvent::ToggleVisibility)))
                                     .child("\u{25B6}")
                             )
-                            .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(rgb(0xcdd6f4)).child(format!("Claude ({})", messages.len())))
+                            .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(rgb(0xcdd6f4)).child("Claude"))
                             .child(
                                 div().w(px(8.0)).h(px(8.0)).rounded_full()
                                     .bg(match &self.connection_state {
@@ -331,6 +366,26 @@ impl Render for AgentPanel {
                     )
                     .child(
                         div().flex().items_center().gap_2()
+                            // Permission mode selector (only clickable when disconnected)
+                            .child(
+                                div().id("mode").px_2().py_1().rounded_sm().text_xs()
+                                    .when(!is_connected && self.connection_state != AgentConnectionState::Connecting, |el| {
+                                        el.cursor_pointer()
+                                            .bg(match self.permission_mode {
+                                                PermissionMode::Default => rgb(0x6c7086),
+                                                PermissionMode::BypassPermissions => rgb(0xf9e2af),
+                                                PermissionMode::PlanMode => rgb(0x89b4fa),
+                                            })
+                                            .text_color(rgb(0x1e1e2e))
+                                            .hover(|s| s.opacity(0.8))
+                                            .on_click(cx.listener(|this, _, _, cx| this.cycle_permission_mode(cx)))
+                                    })
+                                    .when(is_connected || self.connection_state == AgentConnectionState::Connecting, |el| {
+                                        el.bg(rgb(0x313244))
+                                            .text_color(rgb(0x9399b2))
+                                    })
+                                    .child(self.permission_mode_label())
+                            )
                             .when_some(self.session_info.as_ref(), |el, info| {
                                 el.child(
                                     div().px_2().py_1().rounded_sm().bg(rgb(0x313244))

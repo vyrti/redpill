@@ -54,17 +54,28 @@ impl ClaudeConnection {
     /// Connect to Claude Code CLI
     ///
     /// Spawns the claude CLI with stream-json mode and returns a receiver for updates.
+    /// Extra args can be used to pass permission flags like "--dangerously-skip-permissions".
     pub fn connect(cwd: &Path) -> Result<(Self, Receiver<SessionUpdate>)> {
-        tracing::info!("Claude: spawning claude CLI in {:?}", cwd);
+        Self::connect_with_args(cwd, &[])
+    }
+
+    /// Connect to Claude Code CLI with additional arguments
+    ///
+    /// Spawns the claude CLI with stream-json mode and extra args.
+    pub fn connect_with_args(cwd: &Path, extra_args: &[&str]) -> Result<(Self, Receiver<SessionUpdate>)> {
+        tracing::info!("Claude: spawning claude CLI in {:?} with extra args: {:?}", cwd, extra_args);
+
+        let mut args = vec![
+            "--print",
+            "--input-format", "stream-json",
+            "--output-format", "stream-json",
+            "--verbose",
+        ];
+        args.extend(extra_args);
 
         // Spawn with stream-json format for bidirectional communication
         let mut child = Command::new("claude")
-            .args([
-                "--print",
-                "--input-format", "stream-json",
-                "--output-format", "stream-json",
-                "--verbose",
-            ])
+            .args(&args)
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
