@@ -8,6 +8,46 @@ mod ui;
 use gpui::*;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+#[cfg(target_os = "macos")]
+fn set_dock_icon() {
+    use cocoa::appkit::{NSApp, NSApplication, NSImage};
+    use cocoa::base::nil;
+    use cocoa::foundation::NSString;
+    use objc::runtime::Object;
+
+    unsafe {
+        // Get path to icon relative to executable
+        let exe_path = std::env::current_exe().ok();
+        let icon_path = exe_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .map(|p| p.join("logo/icon.png"));
+
+        // Fall back to current directory
+        let icon_path = icon_path
+            .filter(|p| p.exists())
+            .unwrap_or_else(|| std::path::PathBuf::from("logo/icon.png"));
+
+        if icon_path.exists() {
+            let path_str = icon_path.to_string_lossy();
+            let ns_path = NSString::alloc(nil).init_str(&path_str);
+            let image: *mut Object = NSImage::alloc(nil).initWithContentsOfFile_(ns_path);
+            if !image.is_null() {
+                let app = NSApp();
+                app.setApplicationIconImage_(image);
+                tracing::info!("Set dock icon from {:?}", icon_path);
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_dock_icon() {
+    // No-op on other platforms
+}
+
 use crate::app::AppState;
 use crate::ui::{open_main_window, QuitConfirmDialog, SessionDialog, SsmSessionDialog};
 
@@ -29,6 +69,9 @@ fn main() {
     Application::new()
         .with_quit_mode(QuitMode::LastWindowClosed)
         .run(|cx: &mut App| {
+        // Set dock icon (macOS)
+        set_dock_icon();
+
         // Set up application menu (macOS)
         #[cfg(target_os = "macos")]
         {

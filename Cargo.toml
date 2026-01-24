@@ -83,6 +83,11 @@ regex-lite = "0.1"
 # Secure credential storage
 keyring = "3"
 
+# macOS dock icon
+[target.'cfg(target_os = "macos")'.dependencies]
+cocoa = "0.26"
+objc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
 
