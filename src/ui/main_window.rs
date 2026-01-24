@@ -4,6 +4,7 @@ use uuid::Uuid;
 
 use crate::app::AppState;
 
+use super::agent_panel::{AgentPanel, AgentPanelEvent};
 use super::quit_confirm_dialog::QuitConfirmDialog;
 use super::session_tree::SessionTree;
 use super::terminal_tabs::{TabContextMenuState, TabInfo, TerminalTabs};
@@ -20,6 +21,8 @@ pub struct MainWindow {
     session_tree: Entity<SessionTree>,
     /// Terminal tabs view
     tabs_view: Entity<TerminalTabs>,
+    /// Agent panel view
+    agent_panel: Entity<AgentPanel>,
     /// Current terminal views (one per tab)
     terminal_views: Vec<(Uuid, Entity<TerminalView>)>,
     /// Active terminal tab ID
@@ -30,6 +33,10 @@ pub struct MainWindow {
     session_tree_width: f32,
     /// Whether currently resizing the session tree
     is_resizing: bool,
+    /// Whether the agent panel is visible
+    agent_panel_visible: bool,
+    /// Subscriptions
+    _subscriptions: Vec<Subscription>,
 }
 
 impl MainWindow {
@@ -42,6 +49,20 @@ impl MainWindow {
         // Create tabs view with empty tabs
         let tabs_view = cx.new(|_| TerminalTabs::new(Vec::new(), None));
 
+        // Create agent panel
+        let agent_panel = cx.new(|cx| AgentPanel::new(cx));
+
+        // Subscribe to agent panel events
+        let agent_subscription = cx.subscribe(&agent_panel, |this, _agent_panel, event, cx| {
+            match event {
+                AgentPanelEvent::ToggleVisibility => {
+                    this.agent_panel_visible = !this.agent_panel_visible;
+                    cx.notify();
+                }
+                _ => {}
+            }
+        });
+
         // Get initial session tree width from config
         let session_tree_width = cx
             .try_global::<AppState>()
@@ -51,11 +72,14 @@ impl MainWindow {
         Self {
             session_tree,
             tabs_view,
+            agent_panel,
             terminal_views: Vec::new(),
             active_tab_id: None,
             prev_active_tab_id: None,
             session_tree_width,
             is_resizing: false,
+            agent_panel_visible: true,
+            _subscriptions: vec![agent_subscription],
         }
     }
 
@@ -395,7 +419,7 @@ impl Render for MainWindow {
                                 })),
                         )
                     })
-                    // Terminal area (right side)
+                    // Terminal area (center)
                     .child(
                         div()
                             .flex()
@@ -423,7 +447,38 @@ impl Render for MainWindow {
                                             )
                                     }),
                             ),
-                    ),
+                    )
+                    // Agent panel (right sidebar)
+                    .when(self.agent_panel_visible, |this| {
+                        this.child(self.agent_panel.clone())
+                    })
+                    // Agent panel toggle button (when panel is hidden)
+                    .when(!self.agent_panel_visible, |this| {
+                        this.child(
+                            div()
+                                .id("expand-agent-btn")
+                                .w(px(24.0))
+                                .h_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .bg(rgb(0x1e1e2e))
+                                .border_l_1()
+                                .border_color(rgb(0x313244))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(0x313244)))
+                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                    this.agent_panel_visible = true;
+                                    cx.notify();
+                                }))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0x6c7086))
+                                        .child("\u{25C0}"),
+                                ),
+                        )
+                    }),
             )
             // Status bar
             .child(

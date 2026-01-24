@@ -40,6 +40,7 @@ pub struct TerminalTabs {
     tabs: Vec<TabInfo>,
     active_tab: Option<Uuid>,
     scroll_offset: f32,
+    prev_tab_count: usize,
     context_menu: Option<TabContextMenuState>,
 }
 
@@ -63,10 +64,12 @@ impl From<&TerminalTab> for TabInfo {
 
 impl TerminalTabs {
     pub fn new(tabs: Vec<TabInfo>, active_tab: Option<Uuid>) -> Self {
+        let tab_count = tabs.len();
         Self {
             tabs,
             active_tab,
             scroll_offset: 0.0,
+            prev_tab_count: tab_count,
             context_menu: None,
         }
     }
@@ -179,7 +182,6 @@ impl TerminalTabs {
             self.active_tab = Some(keep_id);
         }
         self.context_menu = None;
-        self.scroll_offset = 0.0;
         cx.notify();
         window.refresh();
     }
@@ -228,7 +230,6 @@ impl TerminalTabs {
             }
         }
         self.context_menu = None;
-        self.scroll_offset = 0.0;
         cx.notify();
         window.refresh();
     }
@@ -244,21 +245,8 @@ impl TerminalTabs {
             self.active_tab = None;
         }
         self.context_menu = None;
-        self.scroll_offset = 0.0;
         cx.notify();
         window.refresh();
-    }
-
-    /// Scroll tabs left
-    fn scroll_left(&mut self, cx: &mut Context<Self>) {
-        self.scroll_offset = (self.scroll_offset - 120.0).max(0.0);
-        cx.notify();
-    }
-
-    /// Scroll tabs right
-    fn scroll_right(&mut self, cx: &mut Context<Self>) {
-        self.scroll_offset += 120.0;
-        cx.notify();
     }
 
     fn render_tab(&self, tab: &TabInfo, tab_index: usize, is_active: bool, cx: &mut Context<Self>) -> impl IntoElement {
@@ -325,6 +313,16 @@ impl TerminalTabs {
             )
     }
 
+    fn scroll_left(&mut self, cx: &mut Context<Self>) {
+        self.scroll_offset = (self.scroll_offset - 120.0).max(0.0);
+        cx.notify();
+    }
+
+    fn scroll_right(&mut self, max_scroll: f32, cx: &mut Context<Self>) {
+        self.scroll_offset = (self.scroll_offset + 120.0).min(max_scroll);
+        cx.notify();
+    }
+
     fn render_scroll_button(&self, direction: &str, enabled: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let is_left = direction == "left";
         let arrow = if is_left { "◀" } else { "▶" };
@@ -337,6 +335,8 @@ impl TerminalTabs {
             .w(px(24.0))
             .h_full()
             .flex_shrink_0()
+            .border_b_1()
+            .border_color(rgb(0x313244))
             .when(enabled, |this| {
                 this.cursor_pointer()
                     .hover(|style| style.bg(rgb(0x313244)))
@@ -347,7 +347,8 @@ impl TerminalTabs {
                     })
                     .when(!is_left, |this| {
                         this.on_click(cx.listener(|this, _event, _window, cx| {
-                            this.scroll_right(cx);
+                            let max = this.calculate_max_scroll();
+                            this.scroll_right(max, cx);
                         }))
                     })
             })
@@ -357,6 +358,16 @@ impl TerminalTabs {
                     .text_color(if enabled { rgb(0x6c7086) } else { rgb(0x45475a) })
                     .child(arrow),
             )
+    }
+
+    fn calculate_max_scroll(&self) -> f32 {
+        // Each tab is ~120px, keep at least 2 tabs visible
+        let tab_count = self.tabs.len();
+        if tab_count <= 2 {
+            0.0
+        } else {
+            (tab_count - 2) as f32 * 120.0
+        }
     }
 }
 
@@ -371,19 +382,33 @@ impl Render for TerminalTabs {
 
         let tabs: Vec<_> = self.tabs.clone();
         let active_tab = self.active_tab;
+        let tab_count = tabs.len();
+
+        // Calculate max scroll (keep at least 2 tabs visible)
+        let max_scroll = if tab_count <= 2 {
+            0.0
+        } else {
+            (tab_count - 2) as f32 * 120.0
+        };
+
+        // When a new tab is added, scroll to show it (scroll by one tab)
+        if tab_count > self.prev_tab_count && self.prev_tab_count > 0 && tab_count > 6 {
+            self.scroll_offset = (self.scroll_offset + 120.0).min(max_scroll);
+        }
+
+        // Clamp scroll offset
+        self.scroll_offset = self.scroll_offset.clamp(0.0, max_scroll);
+
+        // Update state for next render
+        self.prev_tab_count = tab_count;
+
         let scroll_offset = self.scroll_offset;
-
-        // Estimate content width (each tab is roughly 120px)
-        let estimated_tab_width = 120.0;
-        let estimated_content_width = tabs.len() as f32 * estimated_tab_width;
-
-        // Show scroll buttons when there are many tabs
-        let show_scroll_buttons = tabs.len() > 5;
+        let show_scroll_buttons = tab_count > 6;
         let can_scroll_left = scroll_offset > 0.0;
-        let can_scroll_right = scroll_offset < estimated_content_width - 400.0; // rough estimate
+        let can_scroll_right = scroll_offset < max_scroll;
 
         let mut root = div()
-            .relative()
+            .id("tab-bar")
             .flex()
             .items_center()
             .w_full()
@@ -397,15 +422,17 @@ impl Render for TerminalTabs {
             root = root.child(self.render_scroll_button("left", can_scroll_left, cx));
         }
 
-        // Tab list with scroll transform
+        // Tab container with manual scroll via negative margin
         root = root.child(
             div()
-                .flex()
                 .flex_1()
+                .h_full()
                 .overflow_hidden()
                 .child(
                     div()
+                        .id("tabs")
                         .flex()
+                        .h_full()
                         .ml(px(-scroll_offset))
                         .children(
                             tabs.iter().enumerate().map(|(index, tab)| {
@@ -431,6 +458,8 @@ impl Render for TerminalTabs {
                 .w(px(40.0))
                 .h_full()
                 .flex_shrink_0()
+                .border_b_1()
+                .border_color(rgb(0x313244))
                 .cursor_pointer()
                 .hover(|style| style.bg(rgb(0x313244)))
                 .on_click(cx.listener(|this, _event, window, cx| {
@@ -443,8 +472,6 @@ impl Render for TerminalTabs {
                         .child("+"),
                 ),
         );
-
-        // Note: Context menu is rendered in MainWindow to avoid clipping issues
 
         root
     }

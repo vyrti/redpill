@@ -1,6 +1,16 @@
 use gpui::*;
 use gpui::prelude::*;
 
+/// Events emitted by TextField
+pub enum TextFieldEvent {
+    /// Content changed
+    Changed(String),
+    /// Enter key pressed (submit)
+    Submit,
+}
+
+impl EventEmitter<TextFieldEvent> for TextField {}
+
 /// A text input component with focus handling and keyboard events
 pub struct TextField {
     focus_handle: FocusHandle,
@@ -78,6 +88,7 @@ impl TextField {
         if let Some(ref callback) = self.on_change {
             callback(&self.content, cx);
         }
+        cx.emit(TextFieldEvent::Changed(self.content.clone()));
         cx.notify();
     }
 
@@ -90,6 +101,7 @@ impl TextField {
             if let Some(ref callback) = self.on_change {
                 callback(&self.content, cx);
             }
+            cx.emit(TextFieldEvent::Changed(self.content.clone()));
             cx.notify();
         }
     }
@@ -102,6 +114,7 @@ impl TextField {
             if let Some(ref callback) = self.on_change {
                 callback(&self.content, cx);
             }
+            cx.emit(TextFieldEvent::Changed(self.content.clone()));
             cx.notify();
         }
     }
@@ -175,6 +188,10 @@ impl Render for TextField {
                 let is_cmd_or_ctrl = keystroke.modifiers.platform || keystroke.modifiers.control;
 
                 match keystroke.key.as_str() {
+                    "enter" if !keystroke.modifiers.shift => {
+                        tracing::info!("TextField: Enter pressed, emitting Submit");
+                        cx.emit(TextFieldEvent::Submit);
+                    }
                     "backspace" => this.handle_backspace(cx),
                     "delete" => this.handle_delete(cx),
                     "left" => this.move_left(cx),
@@ -208,8 +225,12 @@ impl Render for TextField {
                             if let Some(ref callback) = this.on_change {
                                 callback(&this.content, cx);
                             }
+                            cx.emit(TextFieldEvent::Changed(this.content.clone()));
                             cx.notify();
                         }
+                    }
+                    "space" => {
+                        this.handle_input(" ", cx);
                     }
                     key if key.len() == 1 && !keystroke.modifiers.control && !keystroke.modifiers.platform && !keystroke.modifiers.alt => {
                         this.handle_input(key, cx);

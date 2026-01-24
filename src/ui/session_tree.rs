@@ -246,7 +246,6 @@ impl SessionTree {
         let group_id = group.id;
         let group_name = group.name.clone();
         let group_name_for_menu = group.name.clone();
-        let group_name_for_delete = group.name.clone();
         let group_color = group.color.clone();
 
         div()
@@ -294,93 +293,6 @@ impl SessionTree {
                             .child(group_name),
                     ),
             )
-            .child(
-                div()
-                    .flex()
-                    .gap_1()
-                    .opacity(0.0)
-                    .group_hover("group-row", |this| this.opacity(1.0))
-                    // Edit button
-                    .child(
-                        div()
-                            .id(ElementId::Name(format!("group-edit-{}", group_id).into()))
-                            .px_1()
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .text_xs()
-                            .text_color(rgb(0x6c7086))
-                            .hover(|style| style.bg(rgb(0x45475a)).text_color(rgb(0xf9e2af)))
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
-                                cx.stop_propagation();
-                                this.request_edit_group(group_id, cx);
-                            }))
-                            .child("✏"),
-                    )
-                    // Delete button
-                    .child(
-                        div()
-                            .id(ElementId::Name(format!("group-delete-{}", group_id).into()))
-                            .px_1()
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .text_xs()
-                            .text_color(rgb(0x6c7086))
-                            .hover(|style| style.bg(rgb(0x45475a)).text_color(rgb(0xf38ba8)))
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
-                                cx.stop_propagation();
-                                this.request_delete_group(group_id, group_name_for_delete.clone(), cx);
-                            }))
-                            .child("🗑"),
-                    )
-                    // Connect All button for this group
-                    .child(
-                        div()
-                            .id(ElementId::Name(format!("group-connect-all-{}", group_id).into()))
-                            .px_1()
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .text_xs()
-                            .text_color(rgb(0x6c7086))
-                            .hover(|style| style.bg(rgb(0x45475a)).text_color(rgb(0xa6e3a1)))
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
-                                cx.stop_propagation();
-                                this.handle_mass_connect(group_id, cx);
-                            }))
-                            .child(">>"),
-                    )
-                    // Add session button for this group
-                    .child(
-                        div()
-                            .id(ElementId::Name(format!("group-add-{}", group_id).into()))
-                            .px_1()
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .text_xs()
-                            .text_color(rgb(0x6c7086))
-                            .hover(|style| style.bg(rgb(0x45475a)).text_color(rgb(0x89b4fa)))
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
-                                cx.stop_propagation();
-                                this.request_new_session(Some(group_id), cx);
-                            }))
-                            .child("+"),
-                    )
-                    // Add sub-group button
-                    .child(
-                        div()
-                            .id(ElementId::Name(format!("group-add-subgroup-{}", group_id).into()))
-                            .px_1()
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .text_xs()
-                            .text_color(rgb(0x6c7086))
-                            .hover(|style| style.bg(rgb(0x45475a)).text_color(rgb(0xa6e3a1)))
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
-                                cx.stop_propagation();
-                                this.request_new_group(Some(group_id), cx);
-                            }))
-                            .child("📁+"),
-                    ),
-            )
     }
 
     fn render_session_item(
@@ -392,17 +304,14 @@ impl SessionTree {
         let session_id = session.id();
         let session_name = session.name().to_string();
         let session_name_for_menu = session.name().to_string();
-        let session_name_for_delete = session.name().to_string();
         let icon = match session {
             Session::Ssh(_) => "🖥️",
             Session::Local(_) => "💻",
             Session::Ssm(_) => "☁️",
         };
-        let group_id = format!("session-row-{}", session_id);
 
         div()
             .id(ElementId::Name(format!("session-{}", session_id).into()))
-            .group(SharedString::from(group_id.clone()))
             .flex()
             .items_center()
             .justify_between()
@@ -432,45 +341,6 @@ impl SessionTree {
                             .text_sm()
                             .text_color(rgb(0xcdd6f4))
                             .child(session_name),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap_1()
-                    .opacity(0.0)
-                    .group_hover(SharedString::from(group_id), |this| this.opacity(1.0))
-                    // Edit button
-                    .child(
-                        div()
-                            .id(ElementId::Name(format!("session-edit-{}", session_id).into()))
-                            .px_1()
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .text_xs()
-                            .text_color(rgb(0x6c7086))
-                            .hover(|style| style.bg(rgb(0x45475a)).text_color(rgb(0xf9e2af)))
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
-                                cx.stop_propagation();
-                                this.request_edit_session(session_id, cx);
-                            }))
-                            .child("✏"),
-                    )
-                    // Delete button
-                    .child(
-                        div()
-                            .id(ElementId::Name(format!("session-delete-{}", session_id).into()))
-                            .px_1()
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .text_xs()
-                            .text_color(rgb(0x6c7086))
-                            .hover(|style| style.bg(rgb(0x45475a)).text_color(rgb(0xf38ba8)))
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
-                                cx.stop_propagation();
-                                this.request_delete_session(session_id, session_name_for_delete.clone(), cx);
-                            }))
-                            .child("🗑"),
                     ),
             )
     }

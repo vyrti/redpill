@@ -1,3 +1,7 @@
+[workspace]
+members = ["crates/redpill-agent"]
+resolver = "2"
+
 [package]
 name = "redpill-term"
 version = "0.0.1"
@@ -28,6 +32,7 @@ name = "redpill"
 path = "src/main.rs"
 
 [dependencies]
+redpill-agent = { path = "crates/redpill-agent" }
 gpui = { git = "https://github.com/zed-industries/zed", package = "gpui" }
 
 # Terminal Emulation
@@ -49,6 +54,7 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 futures = "0.3"
+async-channel = "2"      # async channels for GPUI integration
 
 # Serialization & Config
 serde = { version = "1.0", features = ["derive"] }

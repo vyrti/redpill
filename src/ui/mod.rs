@@ -1,3 +1,4 @@
+pub mod agent_panel;
 pub mod delete_confirm_dialog;
 pub mod group_dialog;
 pub mod main_window;
@@ -9,6 +10,7 @@ pub mod terminal_tabs;
 pub mod terminal_view;
 pub mod text_field;
 
+pub use agent_panel::{agent_panel, AgentPanel};
 pub use delete_confirm_dialog::{DeleteConfirmDialog, DeleteTarget};
 pub use group_dialog::{group_dialog, edit_group_dialog, GroupDialog, GroupDialogResult};
 pub use quit_confirm_dialog::QuitConfirmDialog;
@@ -18,4 +20,4 @@ pub use session_tree::{session_tree, SessionTree, SessionTreeAction};
 pub use ssm_session_dialog::{ssm_session_dialog, edit_ssm_session_dialog, SsmSessionDialog, SsmSessionDialogResult};
 pub use terminal_tabs::{terminal_tabs, TabAction, TabContextMenuState, TabInfo, TerminalTabs};
 pub use terminal_view::{terminal_view, TerminalView};
-pub use text_field::{text_field, text_field_with_content, TextField};
+pub use text_field::{text_field, text_field_with_content, TextField, TextFieldEvent};
