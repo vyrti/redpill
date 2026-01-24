@@ -10,6 +10,7 @@ use redpill_agent::{
     ClaudeConnection, SessionInfo, SessionUpdate,
     ToolCall, ToolCallStatus, ToolKind,
 };
+use crate::app::AppState;
 use super::text_field::{TextField, TextFieldEvent};
 
 #[derive(Clone, Debug)]
@@ -193,18 +194,25 @@ impl AgentPanel {
     }
 
     fn send_message(&mut self, cx: &mut Context<Self>) {
-        let content = self.input_field.read(cx).content().trim().to_string();
-        if content.is_empty() {
+        let raw_content = self.input_field.read(cx).content().trim().to_string();
+        if raw_content.is_empty() {
             return;
         }
 
-        // Always add user message to chat history
-        self.add_message(MessageRole::User, content.clone());
+        // Expand @terminal if present
+        let content = if raw_content.contains("@terminal") {
+            self.expand_terminal_context(&raw_content, cx)
+        } else {
+            raw_content.clone()
+        };
+
+        // Show user's original message (not expanded)
+        self.add_message(MessageRole::User, raw_content);
         self.input_field.update(cx, |f, _| f.set_content(""));
         self.scroll_to_bottom(cx);
         cx.notify();
 
-        // Send to Claude if connected
+        // Send expanded content to Claude
         if let Some(conn) = self.connection.clone() {
             if let Err(e) = conn.send_message(&content) {
                 self.add_message(MessageRole::System, format!("Error: {}", e));
@@ -215,6 +223,26 @@ impl AgentPanel {
             self.add_message(MessageRole::System, "Not connected".into());
             self.scroll_to_bottom(cx);
             cx.notify();
+        }
+    }
+
+    /// Expand @terminal mentions with actual terminal content
+    fn expand_terminal_context(&self, content: &str, cx: &App) -> String {
+        let terminal_content = cx.try_global::<AppState>()
+            .and_then(|state| {
+                let app = state.app.lock();
+                app.active_tab().map(|tab| {
+                    let terminal = tab.terminal.lock();
+                    terminal.extract_last_lines(100)
+                })
+            });
+
+        match terminal_content {
+            Some(tc) => content.replace(
+                "@terminal",
+                &format!("<terminal_output>\n{}\n</terminal_output>", tc)
+            ),
+            None => content.replace("@terminal", "[No active terminal]"),
         }
     }
 

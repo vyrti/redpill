@@ -1,7 +1,7 @@
 use alacritty_terminal::event::{Notify, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, Msg, Notifier};
 use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::index::{Point, Side};
+use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Cell;
@@ -776,6 +776,45 @@ impl Terminal {
     pub fn has_selection(&self) -> bool {
         let term = self.term.lock();
         term.selection.is_some()
+    }
+
+    /// Extract the last N lines of terminal content as text
+    pub fn extract_last_lines(&self, line_count: usize) -> String {
+        self.with_term(|term| {
+            let screen_lines = term.screen_lines();
+            let history_size = term.history_size();
+            let columns = term.columns();
+            let grid = term.grid();
+
+            let total_lines = history_size + screen_lines;
+            let lines_to_extract = line_count.min(total_lines);
+            let start_offset = total_lines.saturating_sub(lines_to_extract);
+
+            let mut result = Vec::with_capacity(lines_to_extract);
+
+            for i in 0..lines_to_extract {
+                let line_idx = i + start_offset;
+                let line = if line_idx < history_size {
+                    Line(-((history_size - line_idx) as i32))
+                } else {
+                    Line((line_idx - history_size) as i32)
+                };
+
+                let mut line_text = String::with_capacity(columns);
+                for col_idx in 0..columns {
+                    let pt = Point::new(line, Column(col_idx));
+                    let cell = &grid[pt];
+                    if cell.c == '\0' {
+                        line_text.push(' ');
+                    } else {
+                        line_text.push(cell.c);
+                    }
+                }
+                result.push(line_text.trim_end().to_string());
+            }
+
+            result.join("\n")
+        })
     }
 }
 
