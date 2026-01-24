@@ -67,6 +67,8 @@ pub struct AgentPanel {
     update_rx: Option<async_channel::Receiver<SessionUpdate>>,
     skip_first_response: bool,
     next_message_id: usize,
+    awaiting_response: bool,
+    thinking_dots: usize,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -93,10 +95,28 @@ impl AgentPanel {
             update_rx: None,
             skip_first_response: false,
             next_message_id: 0,
+            awaiting_response: false,
+            thinking_dots: 0,
             _subscriptions: vec![input_sub],
         };
 
         panel.auto_connect(cx);
+
+        // Thinking animation timer
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_millis(400)).await;
+                let cont = this.update(cx, |this, cx| {
+                    if this.awaiting_response {
+                        this.thinking_dots = (this.thinking_dots + 1) % 3;
+                        cx.notify();
+                    }
+                    true
+                }).unwrap_or(false);
+                if !cont { break; }
+            }
+        }).detach();
+
         panel
     }
 
@@ -218,6 +238,10 @@ impl AgentPanel {
                 self.add_message(MessageRole::System, format!("Error: {}", e));
                 self.scroll_to_bottom(cx);
                 cx.notify();
+            } else {
+                self.awaiting_response = true;
+                self.thinking_dots = 0;
+                cx.notify();
             }
         } else {
             self.add_message(MessageRole::System, "Not connected".into());
@@ -243,6 +267,30 @@ impl AgentPanel {
                 &format!("<terminal_output>\n{}\n</terminal_output>", tc)
             ),
             None => content.replace("@terminal", "[No active terminal]"),
+        }
+    }
+
+    /// Parse <cmd>...</cmd> tags from text, returning (start, end, command) tuples
+    fn parse_commands(text: &str) -> Vec<(usize, usize, String)> {
+        let re = regex_lite::Regex::new(r"<cmd>([^<]+)</cmd>").unwrap();
+        re.captures_iter(text)
+            .filter_map(|cap| {
+                let full = cap.get(0)?;
+                let cmd = cap.get(1)?.as_str().trim().to_string();
+                if cmd.is_empty() { return None; }
+                Some((full.start(), full.end(), cmd))
+            })
+            .collect()
+    }
+
+    /// Send command to active terminal (without newline, so user can review before pressing enter)
+    fn send_to_terminal(command: &str, cx: &App) {
+        if let Some(state) = cx.try_global::<AppState>() {
+            let app = state.app.lock();
+            if let Some(tab) = app.active_tab() {
+                let terminal = tab.terminal.lock();
+                terminal.write(command.as_bytes());
+            }
         }
     }
 
@@ -298,6 +346,7 @@ impl AgentPanel {
             SessionUpdate::AssistantText { text } => {
                 if self.skip_first_response { return; }
 
+                self.awaiting_response = false;
                 if let Some(last) = self.messages.last_mut() {
                     if last.role == MessageRole::Assistant {
                         last.content.push_str(&text);
@@ -334,11 +383,13 @@ impl AgentPanel {
                     self.skip_first_response = false;
                     return;
                 }
+                self.awaiting_response = false;
                 self.pending_tool_calls.clear();
                 self.scroll_to_bottom(cx);
                 cx.notify();
             }
             SessionUpdate::Error { message } => {
+                self.awaiting_response = false;
                 self.add_message(MessageRole::System, format!("Error: {}", message));
                 self.scroll_to_bottom(cx);
                 cx.notify();
@@ -463,6 +514,14 @@ impl Render for AgentPanel {
                                     MessageRole::System => "",
                                 };
                                 let msg_id = ElementId::Name(format!("msg-{}", msg.id).into());
+
+                                // Parse commands for assistant messages
+                                let commands = if msg.role == MessageRole::Assistant {
+                                    Self::parse_commands(&msg.content)
+                                } else {
+                                    Vec::new()
+                                };
+
                                 div()
                                     .id(msg_id)
                                     .w_full()
@@ -484,14 +543,114 @@ impl Render for AgentPanel {
                                                         .child(label)
                                                 )
                                             })
-                                            .child(
-                                                div()
-                                                    .text_sm()
-                                                    .text_color(tc)
-                                                    .child(msg.content.clone())
-                                            )
+                                            .when(commands.is_empty(), |e| {
+                                                // No commands - render plain text
+                                                e.child(
+                                                    div()
+                                                        .text_sm()
+                                                        .text_color(tc)
+                                                        .child(msg.content.clone())
+                                                )
+                                            })
+                                            .when(!commands.is_empty(), |e| {
+                                                // Has commands - render text segments with command buttons
+                                                let content = msg.content.clone();
+                                                let mut children: Vec<Div> = Vec::new();
+                                                let mut last_end = 0;
+
+                                                for (idx, (start, end, cmd)) in commands.iter().enumerate() {
+                                                    // Text before command
+                                                    if *start > last_end {
+                                                        let text_before = &content[last_end..*start];
+                                                        if !text_before.trim().is_empty() {
+                                                            children.push(
+                                                                div().text_sm().text_color(tc).child(text_before.to_string())
+                                                            );
+                                                        }
+                                                    }
+
+                                                    // Command block with button
+                                                    let cmd_clone = cmd.clone();
+                                                    let btn_id = ElementId::Name(format!("cmd-btn-{}-{}", msg.id, idx).into());
+                                                    children.push(
+                                                        div()
+                                                            .flex()
+                                                            .items_center()
+                                                            .gap_2()
+                                                            .my_1()
+                                                            .px_2()
+                                                            .py_1()
+                                                            .rounded_sm()
+                                                            .bg(rgb(0x45475a))
+                                                            .child(
+                                                                div()
+                                                                    .flex_1()
+                                                                    .text_xs()
+                                                                    .font_family("monospace")
+                                                                    .text_color(rgb(0xa6e3a1))
+                                                                    .child(cmd.clone())
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .id(btn_id)
+                                                                    .px_1()
+                                                                    .cursor_pointer()
+                                                                    .text_xs()
+                                                                    .text_color(rgb(0x89b4fa))
+                                                                    .hover(|s| s.text_color(rgb(0xb4befe)))
+                                                                    .on_click(move |_, _, cx| {
+                                                                        Self::send_to_terminal(&cmd_clone, cx);
+                                                                    })
+                                                                    .child("▶")
+                                                            )
+                                                    );
+
+                                                    last_end = *end;
+                                                }
+
+                                                // Text after last command
+                                                if last_end < content.len() {
+                                                    let text_after = &content[last_end..];
+                                                    if !text_after.trim().is_empty() {
+                                                        children.push(
+                                                            div().text_sm().text_color(tc).child(text_after.to_string())
+                                                        );
+                                                    }
+                                                }
+
+                                                e.child(
+                                                    div()
+                                                        .flex()
+                                                        .flex_col()
+                                                        .children(children)
+                                                )
+                                            })
                                     )
                             }))
+                            // Thinking indicator
+                            .when(self.awaiting_response, |e| {
+                                let dots = ".".repeat(self.thinking_dots + 1);
+                                e.child(
+                                    div()
+                                        .w_full()
+                                        .flex()
+                                        .child(
+                                            div()
+                                                .max_w(px(280.0))
+                                                .bg(rgb(0x313244))
+                                                .rounded_md()
+                                                .px_3()
+                                                .py_2()
+                                                .child(
+                                                    div()
+                                                        .text_sm()
+                                                        .text_color(rgb(0x9399b2))
+                                                        .italic()
+                                                        .child(format!("thinking{}", dots))
+                                                )
+                                        )
+                                )
+                            })
                     )
             )
             // Tool calls

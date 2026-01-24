@@ -70,6 +70,8 @@ impl ClaudeConnection {
             "--input-format", "stream-json",
             "--output-format", "stream-json",
             "--verbose",
+            "--append-system-prompt",
+            "When suggesting shell commands the user might want to run, wrap each command in <cmd>command</cmd> tags. Only use this for actual executable commands, not code snippets or explanations.",
         ];
         args.extend(extra_args);
 
