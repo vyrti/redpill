@@ -19,6 +19,7 @@ use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
 
 use super::events::{event_channel, TerminalEvent, TerminalEventSender};
+use super::k8s_backend::K8sBackend;
 use super::ssh_backend::SshBackend;
 use super::ssm_backend::SsmBackend;
 
@@ -115,6 +116,16 @@ pub enum TerminalMode2 {
         resize_tx: tokio::sync::mpsc::UnboundedSender<TerminalSize>,
         tokio_handle: TokioHandle,
     },
+    /// K8s mode - Kubernetes pod exec connection
+    K8s {
+        notifier: Notifier,
+        backend: Arc<TokioMutex<K8sBackend>>,
+        /// Sender for write data
+        write_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+        /// Sender for resize requests
+        resize_tx: tokio::sync::mpsc::UnboundedSender<TerminalSize>,
+        tokio_handle: TokioHandle,
+    },
     /// SSM mode - AWS Systems Manager Session Manager connection
     Ssm {
         notifier: Notifier,
@@ -181,7 +192,7 @@ impl Terminal {
         let pty_config = PtyOptions {
             shell: None, // Use default shell
             working_directory: None,
-            hold: false,
+            drain_on_exit: false,
             env,
         };
 
@@ -189,7 +200,7 @@ impl Terminal {
         let pty = tty::new(&pty_config, window_size, id.as_u128() as u64)?;
 
         // Create event loop (uses cloned event sender)
-        let event_loop = EventLoop::new(term.clone(), event_tx, pty, pty_config.hold, false)?;
+        let event_loop = EventLoop::new(term.clone(), event_tx, pty, pty_config.drain_on_exit, false)?;
 
         // Get notifier before starting the loop
         let notifier = Notifier(event_loop.channel());
@@ -245,7 +256,7 @@ impl Terminal {
         let pty_config = PtyOptions {
             shell: Some(dummy_shell),
             working_directory: None,
-            hold: false,
+            drain_on_exit: false,
             env: HashMap::new(),
         };
 
@@ -322,7 +333,7 @@ impl Terminal {
         let pty_config = PtyOptions {
             shell: Some(dummy_shell),
             working_directory: None,
-            hold: false,
+            drain_on_exit: false,
             env: HashMap::new(),
         };
 
@@ -362,11 +373,86 @@ impl Terminal {
         })
     }
 
+    /// Create a K8s terminal (display-only mode for Kubernetes pod exec)
+    pub fn new_k8s(config: TerminalConfig, backend: K8sBackend, tokio_handle: TokioHandle) -> io::Result<Self> {
+        let id = Uuid::new_v4();
+        let (event_tx, event_rx) = event_channel();
+
+        // Create terminal config with scrollback history
+        let term_config = TermConfig {
+            scrolling_history: config.scrollback_lines,
+            ..TermConfig::default()
+        };
+
+        // Create terminal size
+        let term_size = SizeInfo::new(config.size.cols, config.size.rows);
+
+        // Create window size (for PTY)
+        let window_size = WindowSize {
+            num_cols: config.size.cols,
+            num_lines: config.size.rows,
+            cell_width: 1,
+            cell_height: 1,
+        };
+
+        // Create the terminal
+        let term = Term::new(term_config, &term_size, event_tx.clone());
+        let term = Arc::new(FairMutex::new(term));
+
+        // Create PTY options - use a null placeholder that blocks
+        #[cfg(windows)]
+        let dummy_shell = tty::Shell::new("cmd.exe".to_string(), vec!["/c".to_string(), "pause>nul".to_string()]);
+        #[cfg(not(windows))]
+        let dummy_shell = tty::Shell::new("/bin/cat".to_string(), vec![]);
+
+        let pty_config = PtyOptions {
+            shell: Some(dummy_shell),
+            working_directory: None,
+            drain_on_exit: false,
+            env: HashMap::new(),
+        };
+
+        // Create a dummy PTY
+        let pty = tty::new(&pty_config, window_size, id.as_u128() as u64)?;
+
+        // Create event loop
+        let event_loop = EventLoop::new(term.clone(), event_tx, pty, false, false)?;
+
+        // Get notifier before starting the loop
+        let notifier = Notifier(event_loop.channel());
+
+        // Spawn the event loop
+        let _join_handle = event_loop.spawn();
+
+        // Set up write and resize channels
+        let (write_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (resize_tx, _) = tokio::sync::mpsc::unbounded_channel();
+
+        let backend_arc = Arc::new(TokioMutex::new(backend));
+
+        Ok(Self {
+            id,
+            term,
+            mode: TerminalMode2::K8s {
+                notifier,
+                backend: backend_arc,
+                write_tx,
+                resize_tx,
+                tokio_handle,
+            },
+            event_rx,
+            config,
+            title: "K8s".to_string(),
+            dirty: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
     /// Update the write sender after I/O setup
     pub fn set_write_tx(&mut self, tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>) {
         match &mut self.mode {
             TerminalMode2::Remote { write_tx, .. } => *write_tx = tx,
             TerminalMode2::Ssm { write_tx, .. } => *write_tx = tx,
+            TerminalMode2::K8s { write_tx, .. } => *write_tx = tx,
             _ => {}
         }
     }
@@ -376,6 +462,7 @@ impl Terminal {
         match &mut self.mode {
             TerminalMode2::Remote { resize_tx, .. } => *resize_tx = tx,
             TerminalMode2::Ssm { resize_tx, .. } => *resize_tx = tx,
+            TerminalMode2::K8s { resize_tx, .. } => *resize_tx = tx,
             _ => {}
         }
     }
@@ -384,6 +471,14 @@ impl Terminal {
     pub fn ssh_backend(&self) -> Option<Arc<TokioMutex<SshBackend>>> {
         match &self.mode {
             TerminalMode2::Remote { backend, .. } => Some(backend.clone()),
+            _ => None,
+        }
+    }
+
+    /// Get the K8s backend (for spawning I/O task)
+    pub fn k8s_backend(&self) -> Option<Arc<TokioMutex<K8sBackend>>> {
+        match &self.mode {
+            TerminalMode2::K8s { backend, .. } => Some(backend.clone()),
             _ => None,
         }
     }
@@ -416,14 +511,12 @@ impl Terminal {
                 // For local terminals, send through the PTY event loop
                 notifier.notify(data.to_vec());
             }
-            TerminalMode2::Remote { .. } | TerminalMode2::Ssm { .. } => {
-                // For SSH/SSM terminals, directly process data through the VT parser
+            TerminalMode2::Remote { .. } | TerminalMode2::Ssm { .. } | TerminalMode2::K8s { .. } => {
+                // For SSH/SSM/K8s terminals, directly process data through the VT parser
                 // This ensures escape sequences (like mouse mode) are handled correctly
                 let mut processor = Processor::<StdSyncHandler>::new();
                 let mut term = self.term.lock();
-                for &byte in data {
-                    processor.advance(&mut *term, byte);
-                }
+                processor.advance(&mut *term, data);
                 // Signal that new content is available for rendering
                 self.dirty.store(true, Ordering::Release);
             }
@@ -450,6 +543,13 @@ impl Terminal {
                 tracing::debug!("SSM write: queuing {} bytes", data.len());
                 if let Err(e) = write_tx.send(data.to_vec()) {
                     tracing::error!("SSM write send error: {}", e);
+                }
+            }
+            TerminalMode2::K8s { write_tx, .. } => {
+                // Send through the write channel (processed by k8s_io_loop)
+                tracing::debug!("K8s write: queuing {} bytes", data.len());
+                if let Err(e) = write_tx.send(data.to_vec()) {
+                    tracing::error!("K8s write send error: {}", e);
                 }
             }
         }
@@ -538,6 +638,16 @@ impl Terminal {
                 tracing::debug!("SSM resize: queuing {}x{}", size.cols, size.rows);
                 if let Err(e) = resize_tx.send(size) {
                     tracing::error!("SSM resize send error: {}", e);
+                }
+            }
+            TerminalMode2::K8s { notifier, resize_tx, .. } => {
+                // Notify the event loop
+                let _ = notifier.0.send(Msg::Resize(window_size));
+
+                // Send resize through channel (handled by I/O loop)
+                tracing::debug!("K8s resize: queuing {}x{}", size.cols, size.rows);
+                if let Err(e) = resize_tx.send(size) {
+                    tracing::error!("K8s resize send error: {}", e);
                 }
             }
         }
@@ -676,6 +786,7 @@ impl Drop for Terminal {
             TerminalMode2::Local { notifier } => notifier,
             TerminalMode2::Remote { notifier, .. } => notifier,
             TerminalMode2::Ssm { notifier, .. } => notifier,
+            TerminalMode2::K8s { notifier, .. } => notifier,
         };
         let _ = notifier.0.send(Msg::Shutdown);
     }

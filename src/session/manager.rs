@@ -1,7 +1,7 @@
 use thiserror::Error;
 use uuid::Uuid;
 
-use super::models::{Session, SessionData, SessionGroup, SshSession, LocalSession, SsmSession};
+use super::models::{K8sSession, LocalSession, Session, SessionData, SessionGroup, SshSession, SsmSession};
 use super::storage::{SessionStorage, StorageError};
 
 /// Errors that can occur during session management
@@ -109,6 +109,15 @@ impl SessionManager {
         self.data.sessions.push(Session::Ssm(session));
         self.dirty = true;
         tracing::info!("Added SSM session: {}", id);
+        id
+    }
+
+    /// Add a new K8s session
+    pub fn add_k8s_session(&mut self, session: K8sSession) -> Uuid {
+        let id = session.id;
+        self.data.sessions.push(Session::K8s(session));
+        self.dirty = true;
+        tracing::info!("Added K8s session: {}", id);
         id
     }
 

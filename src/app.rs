@@ -9,7 +9,7 @@ use gpui::*;
 
 use crate::config::AppConfig;
 use crate::session::{LocalSession, Session, SessionGroup, SessionManager, SshSession, SsmSession};
-use crate::terminal::{SshBackend, SsmBackend, SsmMessageBuilder, Terminal, TerminalConfig, TerminalSize, connect_websocket, handle_ssm_message};
+use crate::terminal::{K8sBackend, SshBackend, SsmBackend, SsmMessageBuilder, Terminal, TerminalConfig, TerminalSize, connect_websocket, handle_ssm_message};
 use futures::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
@@ -111,6 +111,10 @@ impl RedPillApp {
             Session::Ssm(_) => {
                 // For SSM sessions, use the SSM method
                 return self.open_ssm_session(session_id, runtime);
+            }
+            Session::K8s(_) => {
+                // For K8s sessions, use the K8s method
+                return self.open_k8s_session(session_id, runtime);
             }
         };
 
@@ -249,6 +253,10 @@ impl RedPillApp {
                 // For local sessions, just open a local terminal
                 return self.open_local_terminal();
             }
+            Session::K8s(_) => {
+                // For K8s sessions, use the K8s method
+                return self.open_k8s_session(session_id, runtime);
+            }
         };
 
         // Create SSM backend (not connected yet)
@@ -350,6 +358,150 @@ impl RedPillApp {
 
         tracing::info!(
             "Opened SSM session tab: {} for session: {}",
+            id,
+            session_id
+        );
+        Ok(id)
+    }
+
+    /// Open a terminal for a K8s pod exec session
+    pub fn open_k8s_session(&mut self, session_id: Uuid, runtime: &TokioRuntime) -> Result<Uuid, String> {
+        let session = self
+            .session_manager
+            .get_session(session_id)
+            .ok_or_else(|| "Session not found".to_string())?;
+
+        let (k8s_session, color_scheme) = match session {
+            Session::K8s(k8s) => (k8s.clone(), k8s.color_scheme.clone()),
+            _ => return Err("Not a K8s session".to_string()),
+        };
+
+        let title = format!("{}:{}", k8s_session.namespace, k8s_session.pod);
+
+        // Create K8s backend (not connected yet)
+        let backend = K8sBackend::new(k8s_session);
+
+        // Create terminal in K8s mode
+        let config = TerminalConfig::default();
+        let terminal = Terminal::new_k8s(config, backend, runtime.handle().clone())
+            .map_err(|e| format!("Failed to create K8s terminal: {}", e))?;
+
+        // Get the backend for the connection task
+        let backend_arc = terminal
+            .k8s_backend()
+            .expect("K8s terminal should have backend");
+
+        let terminal_arc = Arc::new(Mutex::new(terminal));
+
+        // Spawn the async connection task
+        let terminal_weak = Arc::downgrade(&terminal_arc);
+        let backend_for_connect = backend_arc.clone();
+
+        runtime.spawn(async move {
+            // Connect to K8s and get I/O channels
+            let io_handles = {
+                let mut backend = backend_for_connect.lock().await;
+                // Set terminal size
+                if let Some(term_arc) = terminal_weak.upgrade() {
+                    let term = term_arc.lock();
+                    let size = term.size();
+                    backend.set_size(crate::terminal::k8s_backend::TerminalSize::new(size.cols, size.rows));
+                }
+
+                match backend.connect().await {
+                    Ok(handles) => {
+                        tracing::info!("K8s pod exec connection established");
+                        Some(handles)
+                    }
+                    Err(e) => {
+                        tracing::error!("K8s connection failed: {}", e);
+                        // Display error message in terminal
+                        if let Some(term_arc) = terminal_weak.upgrade() {
+                            let term = term_arc.lock();
+                            let error_msg = format!(
+                                "\x1b[2J\x1b[H\r\n\
+                                \x1b[1;31m  Connection Failed\x1b[0m\r\n\
+                                \r\n\
+                                \x1b[33m  {}\x1b[0m\r\n",
+                                e
+                            );
+                            term.write_to_pty(error_msg.as_bytes());
+                        }
+                        return;
+                    }
+                }
+            };
+
+            let (write_tx, mut read_rx, resize_tx) = match io_handles {
+                Some(handles) => handles,
+                None => {
+                    tracing::error!("Failed to get K8s I/O handles");
+                    return;
+                }
+            };
+
+            // Create unbounded channels for the terminal
+            let (term_write_tx, mut term_write_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+            let (term_resize_tx, mut term_resize_rx) = tokio::sync::mpsc::unbounded_channel::<TerminalSize>();
+
+            // Update terminal channels
+            if let Some(term_arc) = terminal_weak.upgrade() {
+                let mut term = term_arc.lock();
+                term.set_write_tx(term_write_tx);
+                term.set_resize_tx(term_resize_tx);
+            }
+
+            // I/O loop
+            loop {
+                tokio::select! {
+                    // Terminal wants to write to pod
+                    Some(data) = term_write_rx.recv() => {
+                        if write_tx.send(data).await.is_err() {
+                            tracing::info!("K8s write channel closed");
+                            break;
+                        }
+                    }
+
+                    // Data from pod to display
+                    Some(data) = read_rx.recv() => {
+                        if let Some(term_arc) = terminal_weak.upgrade() {
+                            let term = term_arc.lock();
+                            term.write_to_pty(&data);
+                        } else {
+                            break;
+                        }
+                    }
+
+                    // Terminal resize
+                    Some(size) = term_resize_rx.recv() => {
+                        let k8s_size = crate::terminal::k8s_backend::TerminalSize::new(size.cols, size.rows);
+                        if resize_tx.send(k8s_size).await.is_err() {
+                            tracing::warn!("K8s resize channel closed");
+                        }
+                    }
+
+                    else => break,
+                }
+            }
+
+            tracing::info!("K8s I/O loop ended");
+        });
+
+        let tab = TerminalTab {
+            id: Uuid::new_v4(),
+            session_id: Some(session_id),
+            terminal: terminal_arc,
+            title,
+            dirty: false,
+            color_scheme,
+        };
+        let id = tab.id;
+
+        self.tabs.push(tab);
+        self.active_tab = Some(self.tabs.len() - 1);
+
+        tracing::info!(
+            "Opened K8s session tab: {} for session: {}",
             id,
             session_id
         );

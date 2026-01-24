@@ -309,6 +309,70 @@ impl SessionGroup {
     }
 }
 
+/// A Kubernetes pod exec session configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct K8sSession {
+    /// Unique identifier
+    pub id: Uuid,
+    /// Display name for the session
+    pub name: String,
+    /// Kubernetes context name (from kubeconfig)
+    pub context: String,
+    /// Namespace
+    pub namespace: String,
+    /// Pod name
+    pub pod: String,
+    /// Container name (optional, uses first container if None)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
+    /// Optional group membership
+    pub group_id: Option<Uuid>,
+    /// Optional color scheme override for this session
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color_scheme: Option<String>,
+}
+
+impl K8sSession {
+    /// Create a new K8s session
+    pub fn new(
+        name: impl Into<String>,
+        context: impl Into<String>,
+        namespace: impl Into<String>,
+        pod: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            context: context.into(),
+            namespace: namespace.into(),
+            pod: pod.into(),
+            container: None,
+            group_id: None,
+            color_scheme: None,
+        }
+    }
+
+    /// Create with specific container
+    pub fn with_container(
+        name: impl Into<String>,
+        context: impl Into<String>,
+        namespace: impl Into<String>,
+        pod: impl Into<String>,
+        container: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            context: context.into(),
+            namespace: namespace.into(),
+            pod: pod.into(),
+            container: Some(container.into()),
+            group_id: None,
+            color_scheme: None,
+        }
+    }
+}
+
 /// Union type for different session types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "session_type")]
@@ -316,6 +380,7 @@ pub enum Session {
     Ssh(SshSession),
     Local(LocalSession),
     Ssm(SsmSession),
+    K8s(K8sSession),
 }
 
 impl Session {
@@ -325,6 +390,7 @@ impl Session {
             Session::Ssh(s) => s.id,
             Session::Local(s) => s.id,
             Session::Ssm(s) => s.id,
+            Session::K8s(s) => s.id,
         }
     }
 
@@ -334,6 +400,7 @@ impl Session {
             Session::Ssh(s) => &s.name,
             Session::Local(s) => &s.name,
             Session::Ssm(s) => &s.name,
+            Session::K8s(s) => &s.name,
         }
     }
 
@@ -343,6 +410,7 @@ impl Session {
             Session::Ssh(s) => s.group_id,
             Session::Local(s) => s.group_id,
             Session::Ssm(s) => s.group_id,
+            Session::K8s(s) => s.group_id,
         }
     }
 
@@ -352,6 +420,7 @@ impl Session {
             Session::Ssh(s) => s.group_id = group_id,
             Session::Local(s) => s.group_id = group_id,
             Session::Ssm(s) => s.group_id = group_id,
+            Session::K8s(s) => s.group_id = group_id,
         }
     }
 }

@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod kubernetes;
 mod session;
 mod terminal;
 mod ui;

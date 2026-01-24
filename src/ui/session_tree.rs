@@ -1,9 +1,12 @@
 use gpui::*;
 use gpui::prelude::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::mpsc;
 use uuid::Uuid;
 
 use crate::app::AppState;
+use crate::kubernetes::{KubeConfig, KubeContext, KubeClient};
+use crate::kubernetes::client::{KubeNamespace, KubePod};
 use crate::session::{Session, SessionGroup, SshSession, SsmSession};
 use super::session_dialog::SessionDialog;
 use super::group_dialog::GroupDialog;
@@ -109,6 +112,15 @@ impl TreeRenderData {
     }
 }
 
+/// Message for async K8s data updates
+#[derive(Debug)]
+pub enum K8sUpdate {
+    Namespaces { context: String, namespaces: Vec<KubeNamespace> },
+    NamespacesError { context: String, error: String },
+    Pods { context: String, namespace: String, pods: Vec<KubePod> },
+    PodsError { context: String, namespace: String, error: String },
+}
+
 /// Session tree panel component
 pub struct SessionTree {
     state: SessionTreeState,
@@ -119,10 +131,38 @@ pub struct SessionTree {
     pending_delete_session: Option<(Uuid, String)>,
     pending_delete_group: Option<(Uuid, String)>,
     context_menu: Option<ContextMenuState>,
+    /// Kubernetes config loaded from kubeconfig
+    kube_config: Option<KubeConfig>,
+    /// Expanded K8s contexts
+    expanded_k8s_contexts: HashSet<String>,
+    /// Whether the K8s root group is expanded
+    k8s_expanded: bool,
+    /// Loaded namespaces per context
+    k8s_namespaces: HashMap<String, Vec<KubeNamespace>>,
+    /// Loaded pods per context+namespace (key: "context:namespace")
+    k8s_pods: HashMap<String, Vec<KubePod>>,
+    /// Expanded namespaces per context (key: "context:namespace")
+    expanded_k8s_namespaces: HashSet<String>,
+    /// Contexts currently loading namespaces
+    loading_contexts: HashSet<String>,
+    /// Namespaces currently loading pods (key: "context:namespace")
+    loading_namespaces: HashSet<String>,
+    /// Channel receiver for K8s data updates
+    k8s_update_rx: mpsc::Receiver<K8sUpdate>,
+    /// Channel sender for K8s data updates (cloned for async tasks)
+    k8s_update_tx: mpsc::Sender<K8sUpdate>,
 }
 
 impl SessionTree {
     pub fn new() -> Self {
+        // Try to load kubeconfig
+        let kube_config = KubeConfig::load_default().ok();
+        if let Some(ref config) = kube_config {
+            tracing::info!("Loaded kubeconfig with {} contexts", config.contexts.len());
+        }
+
+        let (k8s_update_tx, k8s_update_rx) = mpsc::channel();
+
         Self {
             state: SessionTreeState::new(),
             pending_new_session_group: None,
@@ -132,7 +172,188 @@ impl SessionTree {
             pending_delete_session: None,
             pending_delete_group: None,
             context_menu: None,
+            kube_config,
+            expanded_k8s_contexts: HashSet::new(),
+            k8s_expanded: false,
+            k8s_namespaces: HashMap::new(),
+            k8s_pods: HashMap::new(),
+            expanded_k8s_namespaces: HashSet::new(),
+            loading_contexts: HashSet::new(),
+            loading_namespaces: HashSet::new(),
+            k8s_update_rx,
+            k8s_update_tx,
         }
+    }
+
+    /// Toggle K8s root group expansion
+    fn toggle_k8s_expanded(&mut self, _cx: &mut Context<Self>) {
+        self.k8s_expanded = !self.k8s_expanded;
+    }
+
+    /// Toggle K8s context expansion and load namespaces if needed
+    fn toggle_k8s_context(&mut self, context_name: String, cx: &mut Context<Self>) {
+        if self.expanded_k8s_contexts.contains(&context_name) {
+            self.expanded_k8s_contexts.remove(&context_name);
+        } else {
+            self.expanded_k8s_contexts.insert(context_name.clone());
+            // Load namespaces if not already loaded/loading
+            if !self.k8s_namespaces.contains_key(&context_name) && !self.loading_contexts.contains(&context_name) {
+                self.load_namespaces(context_name, cx);
+            }
+        }
+    }
+
+    /// Toggle K8s namespace expansion and load pods if needed
+    fn toggle_k8s_namespace(&mut self, context_name: String, namespace: String, cx: &mut Context<Self>) {
+        let key = format!("{}:{}", context_name, namespace);
+        if self.expanded_k8s_namespaces.contains(&key) {
+            self.expanded_k8s_namespaces.remove(&key);
+        } else {
+            self.expanded_k8s_namespaces.insert(key.clone());
+            // Load pods if not already loaded/loading
+            if !self.k8s_pods.contains_key(&key) && !self.loading_namespaces.contains(&key) {
+                self.load_pods(context_name, namespace, cx);
+            }
+        }
+    }
+
+    /// Load namespaces for a K8s context
+    fn load_namespaces(&mut self, context_name: String, cx: &mut Context<Self>) {
+        self.loading_contexts.insert(context_name.clone());
+        let tx = self.k8s_update_tx.clone();
+
+        if let Some(app_state) = cx.try_global::<AppState>() {
+            let runtime = app_state.tokio_runtime.clone();
+            let ctx_name = context_name.clone();
+            runtime.spawn(async move {
+                match KubeClient::for_context(&ctx_name).await {
+                    Ok(client) => {
+                        match client.list_namespaces().await {
+                            Ok(namespaces) => {
+                                let _ = tx.send(K8sUpdate::Namespaces {
+                                    context: ctx_name,
+                                    namespaces
+                                });
+                            }
+                            Err(e) => {
+                                let _ = tx.send(K8sUpdate::NamespacesError {
+                                    context: ctx_name,
+                                    error: e.to_string()
+                                });
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(K8sUpdate::NamespacesError {
+                            context: ctx_name,
+                            error: e.to_string()
+                        });
+                    }
+                }
+            });
+        }
+    }
+
+    /// Load pods for a K8s namespace
+    fn load_pods(&mut self, context_name: String, namespace: String, cx: &mut Context<Self>) {
+        let key = format!("{}:{}", context_name, namespace);
+        self.loading_namespaces.insert(key);
+        let tx = self.k8s_update_tx.clone();
+
+        if let Some(app_state) = cx.try_global::<AppState>() {
+            let runtime = app_state.tokio_runtime.clone();
+            let ctx_name = context_name.clone();
+            let ns = namespace.clone();
+            runtime.spawn(async move {
+                match KubeClient::for_context(&ctx_name).await {
+                    Ok(client) => {
+                        match client.list_pods(&ns).await {
+                            Ok(pods) => {
+                                let _ = tx.send(K8sUpdate::Pods {
+                                    context: ctx_name,
+                                    namespace: ns,
+                                    pods
+                                });
+                            }
+                            Err(e) => {
+                                let _ = tx.send(K8sUpdate::PodsError {
+                                    context: ctx_name,
+                                    namespace: ns,
+                                    error: e.to_string()
+                                });
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(K8sUpdate::PodsError {
+                            context: ctx_name,
+                            namespace: ns,
+                            error: e.to_string()
+                        });
+                    }
+                }
+            });
+        }
+    }
+
+    /// Process K8s updates from the channel
+    fn process_k8s_updates(&mut self) -> bool {
+        let mut had_updates = false;
+        while let Ok(update) = self.k8s_update_rx.try_recv() {
+            had_updates = true;
+            match update {
+                K8sUpdate::Namespaces { context, namespaces } => {
+                    tracing::info!("Loaded {} namespaces for context {}", namespaces.len(), context);
+                    self.loading_contexts.remove(&context);
+                    self.k8s_namespaces.insert(context, namespaces);
+                }
+                K8sUpdate::NamespacesError { context, error } => {
+                    tracing::warn!("Failed to load namespaces for {}: {}", context, error);
+                    self.loading_contexts.remove(&context);
+                    // Insert empty to prevent retrying
+                    self.k8s_namespaces.insert(context, vec![]);
+                }
+                K8sUpdate::Pods { context, namespace, pods } => {
+                    let key = format!("{}:{}", context, namespace);
+                    tracing::info!("Loaded {} pods for {}", pods.len(), key);
+                    self.loading_namespaces.remove(&key);
+                    self.k8s_pods.insert(key, pods);
+                }
+                K8sUpdate::PodsError { context, namespace, error } => {
+                    let key = format!("{}:{}", context, namespace);
+                    tracing::warn!("Failed to load pods for {}: {}", key, error);
+                    self.loading_namespaces.remove(&key);
+                    // Insert empty to prevent retrying
+                    self.k8s_pods.insert(key, vec![]);
+                }
+            }
+        }
+        had_updates
+    }
+
+    /// Handle clicking on a pod to exec into it
+    fn handle_pod_exec(&mut self, context: String, namespace: String, pod: String, container: Option<String>, cx: &mut Context<Self>) {
+        tracing::info!("Exec into pod: {}:{}:{}", context, namespace, pod);
+        // Create a K8s session and open it
+        use crate::session::K8sSession;
+
+        let session = if let Some(container) = container {
+            K8sSession::with_container(&pod, &context, &namespace, &pod, container)
+        } else {
+            K8sSession::new(&pod, &context, &namespace, &pod)
+        };
+
+        if let Some(app_state) = cx.try_global::<AppState>() {
+            let runtime = app_state.tokio_runtime.clone();
+            let mut app = app_state.app.lock();
+            // Add session temporarily (or we could have a transient exec)
+            let session_id = session.id;
+            app.session_manager.add_k8s_session(session);
+            if let Err(e) = app.open_k8s_session(session_id, &runtime) {
+                tracing::error!("Failed to exec into pod: {}", e);
+            }
+        }
+        cx.notify();
     }
 
     /// Handle clicking on a group header
@@ -152,6 +373,7 @@ impl SessionTree {
                     Session::Ssh(_) => app.open_ssh_session(session_id, &runtime),
                     Session::Ssm(_) => app.open_ssm_session(session_id, &runtime),
                     Session::Local(_) => app.open_local_terminal(),
+                    Session::K8s(_) => app.open_k8s_session(session_id, &runtime),
                 };
                 if let Err(e) = result {
                     tracing::error!("Failed to open session: {}", e);
@@ -308,6 +530,7 @@ impl SessionTree {
             Session::Ssh(_) => "🖥️",
             Session::Local(_) => "💻",
             Session::Ssm(_) => "☁️",
+            Session::K8s(_) => "⎈",
         };
 
         div()
@@ -618,12 +841,287 @@ impl SessionTree {
             }
         }
 
+        // Render Kubernetes section if kubeconfig exists
+        if let Some(ref kube_config) = self.kube_config {
+            content = content.child(self.render_k8s_section(kube_config, cx));
+        }
+
         content
+    }
+
+    /// Render the Kubernetes section with contexts
+    fn render_k8s_section(&self, config: &KubeConfig, cx: &mut Context<Self>) -> Div {
+        let k8s_expanded = self.k8s_expanded;
+        let chevron = if k8s_expanded { "▼" } else { "▶" };
+        let context_count = config.contexts.len();
+
+        let mut section = div()
+            .mt_2()
+            .pt_2()
+            .border_t_1()
+            .border_color(rgb(0x313244))
+            // K8s header
+            .child(
+                div()
+                    .id("k8s-header")
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(0x313244)))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.toggle_k8s_expanded(cx);
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x6c7086))
+                            .child(chevron),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(0x89b4fa))
+                            .child("⎈ Kubernetes"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x6c7086))
+                            .child(format!("({})", context_count)),
+                    ),
+            );
+
+        // Render contexts if expanded
+        if k8s_expanded {
+            for context in &config.contexts {
+                section = section.child(self.render_k8s_context(context, config, cx));
+            }
+        }
+
+        section
+    }
+
+    /// Render a K8s context item
+    fn render_k8s_context(&self, context: &KubeContext, config: &KubeConfig, cx: &mut Context<Self>) -> Div {
+        let context_name = context.name.clone();
+        let context_name_for_click = context.name.clone();
+        let is_current = config.current_context.as_ref() == Some(&context.name);
+        let is_expanded = self.expanded_k8s_contexts.contains(&context.name);
+        let chevron = if is_expanded { "▼" } else { "▶" };
+        let is_loading = self.loading_contexts.contains(&context.name);
+
+        let current_marker = if is_current { " ●" } else { "" };
+
+        let mut container = div()
+            .ml(px(12.0))
+            .child(
+                // Context header
+                div()
+                    .id(ElementId::Name(format!("k8s-ctx-{}", context.name).into()))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(0x313244)))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.toggle_k8s_context(context_name_for_click.clone(), cx);
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x6c7086))
+                            .child(chevron),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(if is_current { rgb(0xa6e3a1) } else { rgb(0xcdd6f4) })
+                            .child(format!("{}{}", context_name, current_marker)),
+                    )
+                    .when(is_loading, |el| {
+                        el.child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x6c7086))
+                                .child("⏳")
+                        )
+                    }),
+            );
+
+        // Show namespaces if expanded
+        if is_expanded {
+            if let Some(namespaces) = self.k8s_namespaces.get(&context.name) {
+                for ns in namespaces {
+                    container = container.child(self.render_k8s_namespace(&context.name, ns, cx));
+                }
+            } else if is_loading {
+                container = container.child(
+                    div()
+                        .ml(px(24.0))
+                        .text_xs()
+                        .text_color(rgb(0x6c7086))
+                        .child("Loading namespaces...")
+                );
+            }
+        }
+
+        container
+    }
+
+    /// Render a K8s namespace item
+    fn render_k8s_namespace(&self, context_name: &str, namespace: &KubeNamespace, cx: &mut Context<Self>) -> Div {
+        let ctx = context_name.to_string();
+        let ctx_for_click = context_name.to_string();
+        let ns = namespace.name.clone();
+        let ns_for_click = namespace.name.clone();
+        let key = format!("{}:{}", context_name, namespace.name);
+        let is_expanded = self.expanded_k8s_namespaces.contains(&key);
+        let is_loading = self.loading_namespaces.contains(&key);
+        let chevron = if is_expanded { "▼" } else { "▶" };
+
+        let mut container = div()
+            .ml(px(24.0))
+            .child(
+                div()
+                    .id(ElementId::Name(format!("k8s-ns-{}", key).into()))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .py_0p5()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(0x313244)))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.toggle_k8s_namespace(ctx_for_click.clone(), ns_for_click.clone(), cx);
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x6c7086))
+                            .child(chevron),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x89b4fa))
+                            .child("📦"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0xcdd6f4))
+                            .child(ns.clone()),
+                    )
+                    .when(is_loading, |el| {
+                        el.child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x6c7086))
+                                .child("⏳")
+                        )
+                    }),
+            );
+
+        // Show pods if expanded
+        if is_expanded {
+            if let Some(pods) = self.k8s_pods.get(&key) {
+                if pods.is_empty() {
+                    container = container.child(
+                        div()
+                            .ml(px(36.0))
+                            .text_xs()
+                            .text_color(rgb(0x6c7086))
+                            .child("No pods")
+                    );
+                } else {
+                    for pod in pods {
+                        container = container.child(self.render_k8s_pod(&ctx, &namespace.name, pod, cx));
+                    }
+                }
+            } else if is_loading {
+                container = container.child(
+                    div()
+                        .ml(px(36.0))
+                        .text_xs()
+                        .text_color(rgb(0x6c7086))
+                        .child("Loading pods...")
+                );
+            }
+        }
+
+        container
+    }
+
+    /// Render a K8s pod item
+    fn render_k8s_pod(&self, context: &str, namespace: &str, pod: &KubePod, cx: &mut Context<Self>) -> impl IntoElement {
+        let ctx = context.to_string();
+        let ns = namespace.to_string();
+        let pod_name = pod.name.clone();
+        let container = pod.containers.first().cloned();
+
+        // Color based on status
+        let status_color = match pod.status.as_str() {
+            "Running" => rgb(0xa6e3a1), // green
+            "Pending" => rgb(0xf9e2af), // yellow
+            "Succeeded" => rgb(0x6c7086), // gray
+            "Failed" => rgb(0xf38ba8), // red
+            _ => rgb(0x6c7086), // gray
+        };
+
+        div()
+            .id(ElementId::Name(format!("k8s-pod-{}:{}:{}", context, namespace, pod.name).into()))
+            .ml(px(36.0))
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py_0p5()
+            .rounded_sm()
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(0x313244)))
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                this.handle_pod_exec(ctx.clone(), ns.clone(), pod_name.clone(), container.clone(), cx);
+            }))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(status_color)
+                    .child("●"),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0xcdd6f4))
+                    .child(pod.name.clone()),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x6c7086))
+                    .child(format!("({})", pod.ready)),
+            )
     }
 }
 
 impl Render for SessionTree {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Process K8s updates from async tasks
+        if self.process_k8s_updates() {
+            cx.notify();
+        }
+
         // Handle pending dialog requests
         if let Some(group_id) = self.pending_new_session_group.take() {
             let group_id = if group_id.is_nil() { None } else { Some(group_id) };
@@ -657,6 +1155,9 @@ impl Render for SessionTree {
                         }
                         Session::Local(_) => {
                             tracing::info!("Local sessions don't have edit dialogs yet");
+                        }
+                        Session::K8s(_) => {
+                            tracing::info!("K8s sessions don't have edit dialogs yet");
                         }
                     }
                 } else {
