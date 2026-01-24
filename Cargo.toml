@@ -95,6 +95,11 @@ core-foundation-sys = { git = "https://github.com/servo/core-foundation-rs", rev
 core-graphics = { git = "https://github.com/servo/core-foundation-rs", rev = "b10f1efc48343fc5590127ec6d890ffbb8b5bd02" }
 core-graphics-types = { git = "https://github.com/servo/core-foundation-rs", rev = "b10f1efc48343fc5590127ec6d890ffbb8b5bd02" }
 
+[package.metadata.bundle]
+name = "RedPill"
+identifier = "com.redpill.terminal"
+icon = ["logo/icon.icns"]
+
 [profile.release]
 opt-level = 3
 lto = "fat"

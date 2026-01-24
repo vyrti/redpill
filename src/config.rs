@@ -149,29 +149,29 @@ impl ColorScheme {
         }
     }
 
-    /// Default dark theme (Catppuccin-like colors)
+    /// Default dark theme (traditional ANSI colors)
     pub fn default_dark() -> Self {
         Self {
             name: "default".into(),
-            foreground: 0xcdd6f4,
+            foreground: 0xd0d0d0,
             background: 0x1e1e2e,
-            cursor: 0xf5e0dc,
-            black: 0x45475a,
-            red: 0xf38ba8,
-            green: 0xa6e3a1,
-            yellow: 0xf9e2af,
-            blue: 0x89b4fa,
-            magenta: 0xf5c2e7,
-            cyan: 0x94e2d5,
-            white: 0xbac2de,
-            bright_black: 0x585b70,
-            bright_red: 0xf38ba8,
-            bright_green: 0xa6e3a1,
-            bright_yellow: 0xf9e2af,
-            bright_blue: 0x89b4fa,
-            bright_magenta: 0xf5c2e7,
-            bright_cyan: 0x94e2d5,
-            bright_white: 0xa6adc8,
+            cursor: 0xffffff,
+            black: 0x000000,
+            red: 0xcd0000,
+            green: 0x00cd00,
+            yellow: 0xcdcd00,
+            blue: 0x0000ee,
+            magenta: 0xcd00cd,
+            cyan: 0x00cdcd,
+            white: 0xe5e5e5,
+            bright_black: 0x7f7f7f,
+            bright_red: 0xff0000,
+            bright_green: 0x00ff00,
+            bright_yellow: 0xffff00,
+            bright_blue: 0x5c5cff,
+            bright_magenta: 0xff00ff,
+            bright_cyan: 0x00ffff,
+            bright_white: 0xffffff,
         }
     }
 
