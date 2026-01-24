@@ -18,6 +18,11 @@ fn main() {
         .with(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
+    // Install rustls crypto provider (required for kube/TLS)
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
     tracing::info!("Starting RedPill");
 
     // Initialize the gpui application
