@@ -2,13 +2,32 @@ use alacritty_terminal::event::{Notify, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, Msg, Notifier};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point, Side};
-use alacritty_terminal::selection::{Selection, SelectionType};
+use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::cell::Cell;
+use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
 use alacritty_terminal::tty::{self, Options as PtyOptions};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb, StdSyncHandler};
+
+/// Indexed cell for rendering
+#[derive(Clone)]
+pub struct IndexedCell {
+    pub point: Point,
+    pub cell: Cell,
+}
+
+/// Cached terminal content for lock-free rendering
+#[derive(Clone, Default)]
+pub struct TerminalContent {
+    pub cells: Vec<IndexedCell>,
+    pub mode: TermMode,
+    pub display_offset: usize,
+    pub history_size: usize,
+    pub selection: Option<SelectionRange>,
+    pub cursor_point: Point,
+    pub colors: Colors,
+}
 use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -155,6 +174,8 @@ pub struct Terminal {
     /// Flag indicating new content has been written (for SSH mode)
     /// This allows the UI to know when to redraw without polling events
     dirty: Arc<AtomicBool>,
+    /// Cached content for lock-free rendering (like Zed's last_content)
+    pub last_content: TerminalContent,
 }
 
 impl Terminal {
@@ -216,6 +237,7 @@ impl Terminal {
             config,
             title: "Terminal".to_string(),
             dirty: Arc::new(AtomicBool::new(false)),
+            last_content: TerminalContent::default(),
         })
     }
 
@@ -293,6 +315,7 @@ impl Terminal {
             config,
             title: "SSH".to_string(),
             dirty: Arc::new(AtomicBool::new(false)),
+            last_content: TerminalContent::default(),
         })
     }
 
@@ -370,6 +393,7 @@ impl Terminal {
             config,
             title: "SSM".to_string(),
             dirty: Arc::new(AtomicBool::new(false)),
+            last_content: TerminalContent::default(),
         })
     }
 
@@ -444,6 +468,7 @@ impl Terminal {
             config,
             title: "K8s".to_string(),
             dirty: Arc::new(AtomicBool::new(false)),
+            last_content: TerminalContent::default(),
         })
     }
 
@@ -776,6 +801,32 @@ impl Terminal {
     pub fn has_selection(&self) -> bool {
         let term = self.term.lock();
         term.selection.is_some()
+    }
+
+    /// Sync terminal content to cache for lock-free rendering (like Zed's sync())
+    /// Uses lock_unfair to avoid blocking PTY event loop
+    pub fn sync(&mut self) {
+        // Use lock_unfair like Zed does - don't block if PTY is busy
+        let term = self.term.lock_unfair();
+        let content = term.renderable_content();
+
+        // Extract cells from display_iter (only cells with content)
+        let mut cells = Vec::with_capacity(content.display_iter.size_hint().0);
+        cells.extend(content.display_iter.map(|ic| IndexedCell {
+            point: ic.point,
+            cell: ic.cell.clone(),
+        }));
+
+        let grid = term.grid();
+        self.last_content = TerminalContent {
+            cells,
+            mode: content.mode,
+            display_offset: content.display_offset,
+            history_size: term.history_size(),
+            selection: content.selection,
+            cursor_point: grid.cursor.point,
+            colors: *term.colors(),
+        };
     }
 
     /// Extract the last N lines of terminal content as text

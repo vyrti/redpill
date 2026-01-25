@@ -246,11 +246,9 @@ impl Render for SplitContainer {
         let is_resizing = self.is_resizing;
 
         if pane_count == 1 {
-            // Single pane - no split
-            return div()
-                .size_full()
-                .child(self.panes[0].clone())
-                .into_any_element();
+            // Single pane - no split, just render the terminal view directly
+            // Focus is delegated to the TerminalView inside
+            return self.panes[0].clone().into_any_element();
         }
 
         // Build split layout

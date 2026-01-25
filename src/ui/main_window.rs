@@ -2,14 +2,17 @@ use gpui::*;
 use gpui::prelude::*;
 use parking_lot::Mutex;
 use std::sync::Arc;
+use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
 
 use crate::app::AppState;
+use crate::sftp::SftpBrowser;
 use crate::terminal::Terminal;
 
 use super::agent_panel::{AgentPanel, AgentPanelEvent};
 use super::quit_confirm_dialog::QuitConfirmDialog;
 use super::session_tree::SessionTree;
+use super::sftp_panel::{SftpPanel, SftpPanelEvent};
 use super::split_container::SplitContainer;
 use super::terminal_tabs::{TabContextMenuState, TabInfo, TerminalTabs};
 
@@ -21,6 +24,10 @@ const MAX_TREE_WIDTH: f32 = 500.0;
 const MIN_AGENT_WIDTH: f32 = 280.0;
 /// Maximum agent panel width in pixels
 const MAX_AGENT_WIDTH: f32 = 800.0;
+/// Minimum SFTP panel width in pixels
+const MIN_SFTP_WIDTH: f32 = 250.0;
+/// Maximum SFTP panel width in pixels
+const MAX_SFTP_WIDTH: f32 = 600.0;
 
 /// Main window component
 pub struct MainWindow {
@@ -46,6 +53,14 @@ pub struct MainWindow {
     is_resizing_agent: bool,
     /// Whether the agent panel is visible
     agent_panel_visible: bool,
+    /// SFTP panel view (created on demand for SSH tabs)
+    sftp_panel: Option<Entity<SftpPanel>>,
+    /// Whether the SFTP panel is visible
+    sftp_panel_visible: bool,
+    /// SFTP panel width in pixels
+    sftp_panel_width: f32,
+    /// Whether currently resizing the SFTP panel
+    is_resizing_sftp: bool,
     /// Subscriptions
     _subscriptions: Vec<Subscription>,
 }
@@ -98,6 +113,10 @@ impl MainWindow {
             agent_panel_width,
             is_resizing_agent: false,
             agent_panel_visible: true,
+            sftp_panel: None,
+            sftp_panel_visible: false,
+            sftp_panel_width: 300.0,
+            is_resizing_sftp: false,
             _subscriptions: vec![agent_subscription],
         }
     }
@@ -453,6 +472,127 @@ impl MainWindow {
             cx.stop_propagation();
             return;
         }
+
+        // Toggle SFTP panel: Cmd+Shift+B (Mac) or Ctrl+Shift+B
+        if keystroke.modifiers.shift
+            && (keystroke.modifiers.platform || keystroke.modifiers.control)
+            && keystroke.key == "b"
+        {
+            self.toggle_sftp_panel(cx);
+            cx.stop_propagation();
+            return;
+        }
+    }
+
+    /// Toggle the SFTP panel visibility (only for SSH sessions)
+    fn toggle_sftp_panel(&mut self, cx: &mut Context<Self>) {
+        // Get info about current tab
+        let (is_ssh_session, has_sftp_browser, ssh_backend, tab_id) = {
+            let Some(state) = cx.try_global::<AppState>() else {
+                return;
+            };
+            let app = state.app.lock();
+            let tab = app.active_tab();
+
+            let is_ssh = tab.map(|t| t.session_id.is_some()).unwrap_or(false);
+            let has_sftp = tab.map(|t| t.sftp_browser.is_some()).unwrap_or(false);
+            let backend = tab.and_then(|t| {
+                let terminal = t.terminal.lock();
+                terminal.ssh_backend()
+            });
+            let tab_id = tab.map(|t| t.id);
+
+            (is_ssh, has_sftp, backend, tab_id)
+        };
+
+        if !is_ssh_session {
+            tracing::debug!("SFTP panel not available for non-SSH sessions");
+            return;
+        }
+
+        // Toggle visibility
+        self.sftp_panel_visible = !self.sftp_panel_visible;
+
+        // If showing and no SFTP browser exists yet, create one
+        if self.sftp_panel_visible && !has_sftp_browser {
+            if let (Some(backend), Some(tab_id)) = (ssh_backend, tab_id) {
+                // Spawn async task to create SFTP session
+                cx.spawn(async move |entity, cx| {
+                    // Create SFTP session from SSH backend
+                    let sftp_result = {
+                        let mut backend = backend.lock().await;
+                        backend.create_sftp_session().await
+                    };
+
+                    match sftp_result {
+                        Ok(sftp_session) => {
+                            // Create SftpBrowser and set session
+                            let mut browser = SftpBrowser::new();
+                            browser.set_session(sftp_session);
+                            let browser_arc = Arc::new(TokioMutex::new(browser));
+
+                            // Store in tab
+                            let _ = cx.update_global::<AppState, _>(|state, _cx| {
+                                let mut app = state.app.lock();
+                                if let Some(tab) = app.tabs.iter_mut().find(|t| t.id == tab_id) {
+                                    tab.sftp_browser = Some(browser_arc.clone());
+                                }
+                            });
+
+                            // Create the panel UI
+                            entity.update(cx, |this, cx| {
+                                let panel = cx.new(|cx| SftpPanel::new(browser_arc, cx));
+                                // Subscribe to panel events
+                                let _subscription = cx.subscribe(&panel, |this, _panel, event, cx| {
+                                    match event {
+                                        SftpPanelEvent::Close => {
+                                            this.sftp_panel_visible = false;
+                                            cx.notify();
+                                        }
+                                    }
+                                });
+                                this.sftp_panel = Some(panel);
+                                cx.notify();
+                            }).ok();
+
+                            tracing::info!("SFTP panel created for tab {}", tab_id);
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to create SFTP session: {}", e);
+                            // Hide panel on error
+                            entity.update(cx, |this, cx| {
+                                this.sftp_panel_visible = false;
+                                cx.notify();
+                            }).ok();
+                        }
+                    }
+                }).detach();
+            }
+        } else if self.sftp_panel_visible && self.sftp_panel.is_none() {
+            // SFTP browser exists but panel doesn't - create panel
+            if let Some(browser) = cx.try_global::<AppState>().and_then(|state| {
+                let app = state.app.lock();
+                app.active_tab().and_then(|tab| tab.sftp_browser.clone())
+            }) {
+                let panel = cx.new(|cx| SftpPanel::new(browser, cx));
+                let _subscription = cx.subscribe(&panel, |this, _panel, event, cx| {
+                    match event {
+                        SftpPanelEvent::Close => {
+                            this.sftp_panel_visible = false;
+                            cx.notify();
+                        }
+                    }
+                });
+                self.sftp_panel = Some(panel);
+            }
+        }
+
+        cx.notify();
+    }
+
+    /// Finish SFTP panel resize operation
+    fn finish_sftp_resize(&mut self, _cx: &mut Context<Self>) {
+        self.is_resizing_sftp = false;
     }
 }
 
@@ -481,6 +621,9 @@ impl Render for MainWindow {
         let is_resizing = self.is_resizing;
         let agent_width = self.agent_panel_width;
         let is_resizing_agent = self.is_resizing_agent;
+        let sftp_width = self.sftp_panel_width;
+        let is_resizing_sftp = self.is_resizing_sftp;
+        let sftp_panel_visible = self.sftp_panel_visible;
 
         // Get tab context menu state
         let tab_context_menu = self.tabs_view.read(cx).context_menu_state();
@@ -507,6 +650,14 @@ impl Render for MainWindow {
                     this.session_tree_width = new_width;
                     cx.notify();
                 }
+                if this.is_resizing_sftp {
+                    let x: f32 = event.position.x.into();
+                    // SFTP panel width is measured from right (before agent panel)
+                    let agent_offset = if this.agent_panel_visible { this.agent_panel_width } else { 24.0 };
+                    let new_width = (window_width - x - agent_offset).clamp(MIN_SFTP_WIDTH, MAX_SFTP_WIDTH);
+                    this.sftp_panel_width = new_width;
+                    cx.notify();
+                }
                 if this.is_resizing_agent {
                     let x: f32 = event.position.x.into();
                     // Agent panel width is measured from the right edge
@@ -518,11 +669,13 @@ impl Render for MainWindow {
             // Window-level mouse up handler to end resize
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _event, _window, cx| {
                 this.finish_resize(cx);
+                this.finish_sftp_resize(cx);
                 this.finish_agent_resize(cx);
             }))
             // Also handle mouse up outside window (when dragged out)
             .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _event, _window, cx| {
                 this.finish_resize(cx);
+                this.finish_sftp_resize(cx);
                 this.finish_agent_resize(cx);
             }))
             .child(
@@ -617,6 +770,31 @@ impl Render for MainWindow {
                                     }),
                             ),
                     )
+                    // SFTP panel resize handle
+                    .when(sftp_panel_visible && self.sftp_panel.is_some(), |this| {
+                        this.child(
+                            div()
+                                .id("sftp-resize-handle")
+                                .w(px(6.0))
+                                .h_full()
+                                .cursor_col_resize()
+                                .when(is_resizing_sftp, |s| s.bg(rgb(0x89b4fa)))
+                                .when(!is_resizing_sftp, |s| s.hover(|h| h.bg(rgb(0x45475a))))
+                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _event, _window, cx| {
+                                    this.is_resizing_sftp = true;
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    // SFTP panel (between terminal and agent panel)
+                    .when(sftp_panel_visible && self.sftp_panel.is_some(), |this| {
+                        this.child(
+                            div()
+                                .w(px(sftp_width))
+                                .h_full()
+                                .child(self.sftp_panel.clone().unwrap())
+                        )
+                    })
                     // Agent panel resize handle
                     .when(self.agent_panel_visible, |this| {
                         this.child(

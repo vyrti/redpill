@@ -9,6 +9,7 @@ use gpui::*;
 
 use crate::config::AppConfig;
 use crate::session::{LocalSession, Session, SessionGroup, SessionManager, SshSession, SsmSession};
+use crate::sftp::SftpBrowser;
 use crate::terminal::{K8sBackend, SshBackend, SsmBackend, SsmMessageBuilder, Terminal, TerminalConfig, TerminalSize, connect_websocket, handle_ssm_message};
 use futures::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -27,6 +28,8 @@ pub struct TerminalTab {
     pub dirty: bool,
     /// Color scheme override for this tab
     pub color_scheme: Option<String>,
+    /// SFTP browser for SSH sessions (lazy initialized on demand)
+    pub sftp_browser: Option<Arc<TokioMutex<SftpBrowser>>>,
 }
 
 impl TerminalTab {
@@ -39,6 +42,7 @@ impl TerminalTab {
             title,
             dirty: false,
             color_scheme,
+            sftp_browser: None,
         }
     }
 }
@@ -219,6 +223,7 @@ impl RedPillApp {
             title,
             dirty: false,
             color_scheme,
+            sftp_browser: None, // Initialized on-demand when SFTP panel is opened
         };
         let id = tab.id;
 
@@ -350,6 +355,7 @@ impl RedPillApp {
             title,
             dirty: false,
             color_scheme,
+            sftp_browser: None,
         };
         let id = tab.id;
 
@@ -494,6 +500,7 @@ impl RedPillApp {
             title,
             dirty: false,
             color_scheme,
+            sftp_browser: None,
         };
         let id = tab.id;
 

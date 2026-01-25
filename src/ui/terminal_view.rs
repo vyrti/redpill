@@ -743,18 +743,6 @@ impl Render for TerminalView {
                             // Update bounds origin for mouse coordinate conversion
                             *bounds_origin.lock() = bounds.origin;
 
-                            let terminal = terminal.lock();
-                            let colors = terminal.colors();
-                            let cursor_pos = terminal.cursor_position();
-                            let term_mode = terminal.mode();
-
-                            // Check if cursor should be visible:
-                            // 1. Terminal's SHOW_CURSOR mode must be on
-                            // 2. If focused and blinking: use blink state
-                            // 3. If not focused: always show (but rendered as hollow)
-                            let show_cursor = term_mode.contains(TermMode::SHOW_CURSOR);
-                            let cursor_should_show = show_cursor && (cursor_blink_visible || !focused);
-
                             // Calculate cell dimensions from font metrics
                             let text_system = window.text_system();
                             let font = font(font_family.clone());
@@ -769,112 +757,118 @@ impl Render for TerminalView {
                             let cols = (bounds.size.width / cell_width).floor() as usize;
                             let rows = (bounds.size.height / cell_height).floor() as usize;
 
+                            // Sync and clone content - release lock ASAP
+                            let content = {
+                                let mut terminal = terminal.lock();
+                                terminal.sync();
+                                terminal.last_content.clone()
+                            };
+                            // Lock is now RELEASED
+
+                            let colors = &content.colors;
+                            let cursor_pos = content.cursor_point;
+                            let term_mode = content.mode;
+                            let render_display_offset = content.display_offset;
+                            let render_history_size = content.history_size;
+
+                            // Check if cursor should be visible
+                            let show_cursor = term_mode.contains(TermMode::SHOW_CURSOR);
+                            let cursor_should_show = show_cursor && (cursor_blink_visible || !focused);
+
                             let mut bg_rects = Vec::new();
                             let mut selected_cells = Vec::new();
                             let mut text_runs = Vec::new();
-                            let mut render_display_offset: usize = 0;
-                            let mut render_history_size: usize = 0;
+                            let mut current_run: Option<PositionedTextRun> = None;
+                            let mut current_grid_line: Option<i32> = None;
+                            let mut screen_row: usize = 0;
 
-                            terminal.with_term(|term| {
-                                // Use grid() directly for correct rendering
-                                // This matches the working version (commit 1d8bcdd)
-                                let content = term.grid();
-                                let screen_lines = term.screen_lines();
-                                let columns = term.columns();
+                            // Process cached cells (already extracted, no lock needed)
+                            for indexed_cell in &content.cells {
+                                let cell = &indexed_cell.cell;
+                                let pt = indexed_cell.point;
+                                let grid_line = pt.line.0;
+                                let col_idx = pt.column.0;
 
-                                // Get selection range using term.selection (not renderable_content)
-                                let selection_range = term.selection.as_ref().and_then(|s| s.to_range(term));
+                                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                                    continue;
+                                }
 
-                                // For scrollbar only - don't use for grid access
-                                render_display_offset = content.display_offset();
-                                render_history_size = term.history_size();
-
-                                // Iterate in strict left-to-right, top-to-bottom order
-                                for line_idx in 0..screen_lines {
-                                    // Direct line indexing - NO display_offset adjustment
-                                    let line = Line(line_idx as i32);
-                                    let mut current_run: Option<PositionedTextRun> = None;
-
-                                    for col_idx in 0..columns {
-                                        let col = Column(col_idx);
-                                        let pt = TermPoint::new(line, col);
-                                        let cell = &content[pt];
-
-                                        let screen_row = line_idx;
-
-                                        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                                            continue;
-                                        }
-
-                                        // Check selection using selection_range
-                                        if let Some(ref range) = selection_range {
-                                            if range.contains(pt) {
-                                                selected_cells.push((col_idx, screen_row));
-                                            }
-                                        }
-
-                                        // Handle INVERSE flag (reverse video) - swap fg and bg
-                                        let is_inverse = cell.flags.contains(Flags::INVERSE);
-                                        let (cell_fg, cell_bg) = if is_inverse {
-                                            (cell.bg, cell.fg)
-                                        } else {
-                                            (cell.fg, cell.bg)
-                                        };
-
-                                        // Background color
-                                        if cell_bg != Color::Named(NamedColor::Background) || is_inverse {
-                                            let bg_color = if is_inverse && cell_bg == Color::Named(NamedColor::Foreground) {
-                                                // Default foreground as background in inverse mode
-                                                color_to_hsla(Color::Named(NamedColor::Foreground), &colors, &scheme)
-                                            } else if is_inverse && cell.fg == Color::Named(NamedColor::Foreground) {
-                                                // Use default foreground color for inverse
-                                                color_to_hsla(Color::Named(NamedColor::Foreground), &colors, &scheme)
-                                            } else {
-                                                color_to_hsla(cell_bg, &colors, &scheme)
-                                            };
-                                            bg_rects.push((col_idx, screen_row, bg_color));
-                                        }
-
-                                        let c = cell.c;
-                                        if c == ' ' || c == '\0' {
-                                            if let Some(run) = current_run.take() {
-                                                text_runs.push(run);
-                                            }
-                                            continue;
-                                        }
-
-                                        let fg_color = color_to_hsla(cell_fg, &colors, &scheme);
-                                        let bold = cell.flags.contains(Flags::BOLD);
-
-                                        let can_extend = current_run.as_ref().map_or(false, |run| {
-                                            run.line == screen_row
-                                                && run.col + run.text.chars().count() == col_idx
-                                                && run.fg_color == fg_color
-                                                && run.bold == bold
-                                        });
-
-                                        if can_extend {
-                                            current_run.as_mut().unwrap().text.push(c);
-                                        } else {
-                                            if let Some(run) = current_run.take() {
-                                                text_runs.push(run);
-                                            }
-                                            current_run = Some(PositionedTextRun {
-                                                col: col_idx,
-                                                line: screen_row,
-                                                text: c.to_string(),
-                                                fg_color,
-                                                bold,
-                                            });
-                                        }
-                                    }
-
-                                    // Flush run at end of line
+                                // Track screen row by detecting line changes
+                                if current_grid_line != Some(grid_line) {
                                     if let Some(run) = current_run.take() {
                                         text_runs.push(run);
                                     }
+                                    if current_grid_line.is_some() {
+                                        screen_row += 1;
+                                    }
+                                    current_grid_line = Some(grid_line);
                                 }
-                            });
+
+                                // Check selection
+                                if let Some(ref range) = content.selection {
+                                    if range.contains(pt) {
+                                        selected_cells.push((col_idx, screen_row));
+                                    }
+                                }
+
+                                // Handle INVERSE flag
+                                let is_inverse = cell.flags.contains(Flags::INVERSE);
+                                let (cell_fg, cell_bg) = if is_inverse {
+                                    (cell.bg, cell.fg)
+                                } else {
+                                    (cell.fg, cell.bg)
+                                };
+
+                                // Background color
+                                if cell_bg != Color::Named(NamedColor::Background) || is_inverse {
+                                    let bg_color = if is_inverse && cell_bg == Color::Named(NamedColor::Foreground) {
+                                        color_to_hsla(Color::Named(NamedColor::Foreground), colors, &scheme)
+                                    } else if is_inverse && cell.fg == Color::Named(NamedColor::Foreground) {
+                                        color_to_hsla(Color::Named(NamedColor::Foreground), colors, &scheme)
+                                    } else {
+                                        color_to_hsla(cell_bg, colors, &scheme)
+                                    };
+                                    bg_rects.push((col_idx, screen_row, bg_color));
+                                }
+
+                                let c = cell.c;
+                                if c == ' ' || c == '\0' {
+                                    if let Some(run) = current_run.take() {
+                                        text_runs.push(run);
+                                    }
+                                    continue;
+                                }
+
+                                let fg_color = color_to_hsla(cell_fg, colors, &scheme);
+                                let bold = cell.flags.contains(Flags::BOLD);
+
+                                let can_extend = current_run.as_ref().map_or(false, |run| {
+                                    run.line == screen_row
+                                        && run.col + run.text.chars().count() == col_idx
+                                        && run.fg_color == fg_color
+                                        && run.bold == bold
+                                });
+
+                                if can_extend {
+                                    current_run.as_mut().unwrap().text.push(c);
+                                } else {
+                                    if let Some(run) = current_run.take() {
+                                        text_runs.push(run);
+                                    }
+                                    current_run = Some(PositionedTextRun {
+                                        col: col_idx,
+                                        line: screen_row,
+                                        text: c.to_string(),
+                                        fg_color,
+                                        bold,
+                                    });
+                                }
+                            }
+
+                            // Flush final run
+                            if let Some(run) = current_run.take() {
+                                text_runs.push(run);
+                            }
 
                             // Determine cursor position and shape
                             // Hide cursor when scrolled into history (display_offset > 0)

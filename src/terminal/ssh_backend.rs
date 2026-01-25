@@ -1,6 +1,7 @@
 use russh::client::{self, Handle, Msg};
 use russh::keys::PublicKey;
 use russh::{Channel, ChannelMsg, Disconnect};
+use russh_sftp::client::SftpSession;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -878,6 +879,34 @@ impl SshBackend {
     /// Get access to session config for reconnection
     pub fn config(&self) -> &SshSession {
         &self.config
+    }
+
+    /// Create an SFTP session from the existing SSH connection
+    ///
+    /// Opens a new channel on the SSH session and requests the SFTP subsystem.
+    /// Returns an SftpSession that can be used for file operations.
+    pub async fn create_sftp_session(&mut self) -> SshResult<SftpSession> {
+        let session = self.session.as_ref().ok_or(SshError::NotConnected)?;
+
+        // Open a new session channel for SFTP
+        let sftp_channel = session
+            .channel_open_session()
+            .await
+            .map_err(|e| SshError::SshError(format!("Failed to open SFTP channel: {}", e)))?;
+
+        // Request the SFTP subsystem
+        sftp_channel
+            .request_subsystem(true, "sftp")
+            .await
+            .map_err(|e| SshError::SshError(format!("Failed to request SFTP subsystem: {}", e)))?;
+
+        // Create SFTP session from the channel stream
+        let sftp = SftpSession::new(sftp_channel.into_stream())
+            .await
+            .map_err(|e| SshError::SshError(format!("Failed to initialize SFTP session: {}", e)))?;
+
+        tracing::info!("SFTP session created for {}", self.description());
+        Ok(sftp)
     }
 }
 

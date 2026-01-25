@@ -10,4 +10,4 @@ pub use k8s_backend::{K8sBackend, K8sError};
 pub use keys::keystroke_to_escape;
 pub use ssh_backend::SshBackend;
 pub use ssm_backend::{SsmBackend, SsmError, SsmMessageBuilder, SsmWebSocket, connect_websocket, handle_ssm_message};
-pub use terminal::{Terminal, TerminalConfig, TerminalSize};
+pub use terminal::{IndexedCell, Terminal, TerminalConfig, TerminalContent, TerminalSize};
