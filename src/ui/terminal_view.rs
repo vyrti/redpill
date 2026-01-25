@@ -1,4 +1,3 @@
-use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point as TermPoint, Side};
 use alacritty_terminal::selection::SelectionType;
 use alacritty_terminal::term::cell::Flags;
@@ -757,9 +756,28 @@ impl Render for TerminalView {
                             let cols = (bounds.size.width / cell_width).floor() as usize;
                             let rows = (bounds.size.height / cell_height).floor() as usize;
 
-                            // Sync and clone content - release lock ASAP
+                            // Sync and clone content - resize BEFORE sync if needed
                             let content = {
                                 let mut terminal = terminal.lock();
+
+                                // Check if resize is needed BEFORE syncing
+                                if cols > 0 && rows > 0 {
+                                    let current_size = terminal.size();
+                                    let cols_u16 = cols as u16;
+                                    let rows_u16 = rows as u16;
+
+                                    if current_size.cols != cols_u16
+                                        || current_size.rows != rows_u16
+                                        || current_size.pixel_width == 0
+                                    {
+                                        let cell_w: f32 = cell_width.into();
+                                        let cell_h: f32 = cell_height.into();
+                                        let pixel_width = (cell_w * cols as f32) as u16;
+                                        let pixel_height = (cell_h * rows as f32) as u16;
+                                        terminal.resize(TerminalSize::with_pixels(cols_u16, rows_u16, pixel_width, pixel_height));
+                                    }
+                                }
+
                                 terminal.sync();
                                 terminal.last_content.clone()
                             };
@@ -1114,26 +1132,7 @@ impl Render for TerminalView {
                                 ));
                             }
 
-                            // Check if resize is needed
-                            let cols = data.cols as u16;
-                            let rows = data.rows as u16;
-                            if cols > 0 && rows > 0 {
-                                let mut term = terminal.lock();
-                                let current_size = term.size();
-
-                                // Resize if dimensions changed OR first paint (pixel dimensions are 0)
-                                let needs_resize = current_size.cols != cols
-                                    || current_size.rows != rows
-                                    || current_size.pixel_width == 0;
-
-                                if needs_resize {
-                                    let cell_w: f32 = data.cell_width.into();
-                                    let cell_h: f32 = data.cell_height.into();
-                                    let pixel_width = (cell_w * cols as f32) as u16;
-                                    let pixel_height = (cell_h * rows as f32) as u16;
-                                    term.resize(TerminalSize::with_pixels(cols, rows, pixel_width, pixel_height));
-                                }
-                            }
+                            // Resize is now handled in prepaint before sync()
                         }
                     },
                 )
